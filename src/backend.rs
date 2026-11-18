@@ -5608,7 +5608,17 @@ async fn handle(
             offset,
             generation,
         } => ApiResponse::PlaylistItems {
-            result: routed!(playlist_items(&id, offset, PLAYLIST_PAGE_SIZE)),
+            result: {
+                let mut result = routed!(playlist_items(&id, offset, PLAYLIST_PAGE_SIZE));
+                if let Ok(page) = &mut result
+                    && let Some(engine) = engine.filter(|engine| {
+                        same_account(&engine.session().username(), api.account().as_ref())
+                    })
+                {
+                    session_reads::mark_unavailable(engine.session(), &mut page.items).await;
+                }
+                result
+            },
             id,
             offset,
             generation,

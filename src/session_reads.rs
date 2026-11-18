@@ -3,7 +3,7 @@
 //! no per-app quota, so a playlist someone else owns opens without waiting on
 //! the shared app's rate limit.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base64::Engine as _;
 use librespot_core::{FileId, Session, SpotifyUri, error::ErrorKind, spotify_id::SpotifyId};
@@ -1676,7 +1676,121 @@ async fn metadata_tolerating(
         return Ok(HashMap::new());
     }
     let response = session.spclient().get_extended_metadata(request).await?;
-    answers_tolerating(&asked, tolerated, response)
+    let user = session.user_data();
+    let catalogue = user
+        .attributes
+        .get("catalogue")
+        .map_or("premium", String::as_str);
+    let unavailable = unavailable_tracks(&response, &user.country, catalogue);
+    let mut playables = answers_tolerating(&asked, tolerated, response)?;
+    for uri in unavailable {
+        if let Some(PlayableItem::Track(track)) = playables.get_mut(&uri) {
+            track.is_playable = Some(false);
+        }
+    }
+    Ok(playables)
+}
+
+/// Greys out the songs among `items` this account cannot play. The Web API
+/// says nothing of availability without a market, and asking it for one
+/// would swap songs for their relinked copies, so the session is asked.
+/// Best effort: a failed read leaves the rows as they are.
+pub async fn mark_unavailable(session: &Session, items: &mut [PlaylistItem]) {
+    let uris: Vec<SpotifyUri> = items
+        .iter()
+        .filter_map(|item| match item.playable()? {
+            PlayableItem::Track(track) if !track.is_local && track.is_playable.is_none() => {
+                SpotifyUri::from_uri(&track.uri).ok()
+            }
+            _ => None,
+        })
+        .collect();
+    let (request, asked) = batch(uris.iter());
+    if asked.is_empty() {
+        return;
+    }
+    let Ok(response) = session.spclient().get_extended_metadata(request).await else {
+        return;
+    };
+    let user = session.user_data();
+    let catalogue = user
+        .attributes
+        .get("catalogue")
+        .map_or("premium", String::as_str);
+    let unavailable = unavailable_tracks(&response, &user.country, catalogue);
+    for item in items {
+        if let Some(PlayableItem::Track(track)) = item.item.as_mut().or(item.track.as_mut())
+            && unavailable.contains(&track.uri)
+        {
+            track.is_playable = Some(false);
+        }
+    }
+}
+
+/// The songs in `response` this account cannot play, judged as librespot's
+/// player judges one before refusing it: a restriction for the account's
+/// country and catalogue, a release date not yet reached, or no audio and
+/// no alternative. The last counts only when the batch carries audio files
+/// at all, so an answer that leaves them out never greys out every song.
+fn unavailable_tracks(
+    response: &BatchedExtensionResponse,
+    country: &str,
+    catalogue: &str,
+) -> HashSet<String> {
+    let now = librespot_core::date::Date::now_utc();
+    let mut unavailable = HashSet::new();
+    let mut silent = Vec::new();
+    let mut any_files = false;
+    for array in &response.extended_metadata {
+        if array.extension_kind.enum_value() != Ok(ExtensionKind::TRACK_V4) {
+            continue;
+        }
+        for data in &array.extension_data {
+            let Some(track) = data
+                .extension_data
+                .as_ref()
+                .and_then(|any| {
+                    librespot_protocol::metadata::Track::parse_from_bytes(&any.value).ok()
+                })
+                .and_then(|message| SessionTrack::try_from(&message).ok())
+            else {
+                continue;
+            };
+            any_files |= !track.files.is_empty();
+            let embargoed = now < track.earliest_live_timestamp
+                || (!track.availability.is_empty()
+                    && !track.availability.iter().any(|window| now >= window.start));
+            if embargoed || restricted(&track, country, catalogue) {
+                unavailable.insert(data.entity_uri.clone());
+            } else if track.files.is_empty() && track.alternatives.is_empty() {
+                silent.push(data.entity_uri.clone());
+            }
+        }
+    }
+    if any_files {
+        unavailable.extend(silent);
+    }
+    unavailable
+}
+
+/// Whether the first restriction naming the account's catalogue keeps its
+/// country out: a list of allowed countries without it, or of forbidden
+/// ones with it, as librespot decides.
+fn restricted(track: &SessionTrack, country: &str, catalogue: &str) -> bool {
+    track
+        .restrictions
+        .iter()
+        .filter(|restriction| restriction.catalogue_strs.iter().any(|c| c == catalogue))
+        .find_map(|restriction| {
+            if let Some(allowed) = &restriction.countries_allowed {
+                return Some(!allowed.iter().any(|code| code == country));
+            }
+            restriction
+                .countries_forbidden
+                .as_ref()
+                .map(|forbidden| forbidden.iter().any(|code| code == country))
+        })
+        .unwrap_or(false)
 }
 
 /// Every song of `albums`, album by album in the order given and each in its
@@ -2833,6 +2947,72 @@ mod tests {
         track.set_name("Never Gonna Give You Up".into());
         track.album.mut_or_insert_default().set_gid(vec![0x03; 16]);
         track.write_to_bytes().unwrap()
+    }
+
+    /// A song with audio, restricted as `restrict` says.
+    fn song_bytes(
+        gid: u8,
+        files: bool,
+        restrict: impl FnOnce(&mut librespot_protocol::metadata::Restriction),
+    ) -> Vec<u8> {
+        let mut track = librespot_protocol::metadata::Track::new();
+        track.set_gid(vec![gid; 16]);
+        track.album.mut_or_insert_default().set_gid(vec![0x03; 16]);
+        if files {
+            let mut file = librespot_protocol::metadata::AudioFile::new();
+            file.set_file_id(vec![gid; 20]);
+            file.set_format(librespot_protocol::metadata::audio_file::Format::OGG_VORBIS_160);
+            track.file.push(file);
+        }
+        let mut restriction = librespot_protocol::metadata::Restriction::new();
+        restriction.catalogue_str.push("premium".into());
+        restrict(&mut restriction);
+        track.restriction.push(restriction);
+        track.write_to_bytes().unwrap()
+    }
+
+    /// Songs Spotify keeps out of the account's country, or that have no
+    /// audio left, are marked unavailable; the others are left alone.
+    #[test]
+    fn songs_out_of_reach_for_the_account_are_unavailable() {
+        let uri = |gid: u8| {
+            format!(
+                "spotify:track:{}",
+                SpotifyId::from_raw(&[gid; 16]).unwrap().to_base62()
+            )
+        };
+        let mut array = answer(
+            ExtensionKind::TRACK_V4,
+            &uri(1),
+            200,
+            Some(song_bytes(1, true, |r| {
+                r.set_countries_forbidden("RODE".into())
+            })),
+        );
+        for (gid, bytes) in [
+            (
+                2,
+                song_bytes(2, true, |r| r.set_countries_allowed("USGB".into())),
+            ),
+            (
+                3,
+                song_bytes(3, true, |r| r.set_countries_allowed("FRRO".into())),
+            ),
+            (4, song_bytes(4, false, |_| {})),
+            (5, song_bytes(5, true, |_| {})),
+        ] {
+            array.extension_data.extend(
+                answer(ExtensionKind::TRACK_V4, &uri(gid), 200, Some(bytes)).extension_data,
+            );
+        }
+        let unavailable = unavailable_tracks(&response([array.clone()]), "RO", "premium");
+        let expected: HashSet<String> = [uri(1), uri(2), uri(4)].into_iter().collect();
+        assert_eq!(unavailable, expected);
+        // Without any audio files in the answer, a missing file says nothing.
+        array
+            .extension_data
+            .retain(|data| data.entity_uri == uri(4));
+        assert!(unavailable_tracks(&response([array]), "RO", "premium").is_empty());
     }
 
     fn episode_bytes() -> Vec<u8> {
