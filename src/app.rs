@@ -506,6 +506,14 @@ pub struct App {
     pub queue_tab: QueueTab,
     pub search: SearchState,
     pub playlist_pages: HashMap<String, PlaylistPage>,
+    /// Song keys of each editable playlist, read in the background so the
+    /// Add to playlist picker can mark the ones that already hold a song.
+    playlist_song_keys: HashMap<String, PlaylistSongKeys>,
+    /// Playlists waiting for their song keys; a few are read at a time.
+    playlist_song_keys_queue: std::collections::VecDeque<(String, Option<String>)>,
+    playlist_song_keys_in_flight: usize,
+    /// Set by the picker while it is drawn; loading starts after drawing.
+    pub playlist_song_keys_wanted: bool,
     /// One checkpoint snapshot at a time, including pages evicted while it writes.
     playlist_cache_write_in_flight: bool,
     load_generation: u64,
@@ -1171,6 +1179,10 @@ impl App {
                 .unwrap_or_default(),
             search: SearchState::default(),
             playlist_pages: HashMap::new(),
+            playlist_song_keys: HashMap::new(),
+            playlist_song_keys_queue: std::collections::VecDeque::new(),
+            playlist_song_keys_in_flight: 0,
+            playlist_song_keys_wanted: false,
             playlist_cache_write_in_flight: false,
             load_generation: 0,
             album_pages: HashMap::new(),
@@ -7843,6 +7855,26 @@ impl App {
                     self.add_to_playlist_now(playlist_id, playlist_name, items, position);
                 }
             },
+            ApiResponse::PlaylistSongKeys {
+                playlist_id,
+                snapshot_id,
+                result,
+            } => {
+                self.playlist_song_keys_in_flight =
+                    self.playlist_song_keys_in_flight.saturating_sub(1);
+                if let Some(known) = self.playlist_song_keys.get_mut(&playlist_id) {
+                    known.loading = false;
+                    match result {
+                        Ok(keys) => {
+                            known.keys = Some(keys);
+                            known.snapshot = snapshot_id;
+                        }
+                        // Unmarked rows still add; the next opening asks again.
+                        Err(error) => log::debug!("could not read playlist songs: {error}"),
+                    }
+                }
+                self.load_playlist_song_keys();
+            }
             ApiResponse::PlaylistDuplicatesFound {
                 playlist_id,
                 playlist_name,
@@ -10773,6 +10805,12 @@ impl App {
         }
 
         self.prepare_playlist_mutation(&playlist_id);
+        // Spotify's reads lag its writes, so the mark outlives a re-read.
+        self.playlist_song_keys
+            .entry(playlist_id.clone())
+            .or_default()
+            .added
+            .extend(items.iter().map(PlayableItem::song_key));
         let added = items.len().try_into().unwrap_or(u32::MAX);
         let added_by = self.user_id().map(|id| UserRef {
             id: Some(id.to_string()),
@@ -11013,6 +11051,62 @@ impl App {
             }
             actions = std::mem::take(&mut self.actions);
         }
+        if std::mem::take(&mut self.playlist_song_keys_wanted) {
+            self.load_playlist_song_keys();
+        }
+    }
+
+    /// Queues every editable playlist whose song keys are missing or older
+    /// than its library snapshot, and starts reading the next few.
+    fn load_playlist_song_keys(&mut self) {
+        // Spotify answers 429 to a burst, so only a few playlists read at once.
+        const AT_ONCE: usize = 3;
+        let stale: Vec<(String, Option<String>)> = self
+            .library
+            .playlists
+            .get()
+            .into_iter()
+            .flatten()
+            .filter(|playlist| self.can_edit_playlist(playlist))
+            .filter(|playlist| {
+                self.playlist_song_keys
+                    .get(&playlist.id)
+                    .is_none_or(|known| known.snapshot != playlist.snapshot_id && !known.loading)
+            })
+            .map(|playlist| (playlist.id.clone(), playlist.snapshot_id.clone()))
+            .collect();
+        for (id, snapshot) in stale {
+            let entry = self.playlist_song_keys.entry(id.clone()).or_default();
+            entry.loading = true;
+            self.playlist_song_keys_queue.push_back((id, snapshot));
+        }
+        while self.playlist_song_keys_in_flight < AT_ONCE
+            && let Some((playlist_id, snapshot_id)) = self.playlist_song_keys_queue.pop_front()
+        {
+            self.playlist_song_keys_in_flight += 1;
+            self.backend.api(ApiRequest::PlaylistSongKeys {
+                playlist_id,
+                snapshot_id,
+            });
+        }
+    }
+
+    /// Whether playlist `id` already holds every one of `items`, matched by
+    /// [`PlayableItem::song_key`]; `None` while that is not known yet.
+    pub fn playlist_has_songs(&self, id: &str, items: &[PlayableItem]) -> Option<bool> {
+        if items.is_empty() {
+            return Some(false);
+        }
+        if let Some(known) = self.playlist_song_keys.get(id)
+            && let Some(keys) = &known.keys
+        {
+            return Some(items.iter().all(|item| {
+                let key = item.song_key();
+                keys.contains(&key) || known.added.contains(&key)
+            }));
+        }
+        self.local_playlist_duplicates(id, items)
+            .map(|found| found.len() == items.len())
     }
 
     fn leave_lyrics_fullscreen(&mut self, ctx: &egui::Context) {
@@ -11462,6 +11556,9 @@ impl App {
                 uris,
                 positions,
             } => {
+                // shortcut: forget the playlist's marks and fall back to its open page;
+                // a re-read may still lag the removal by a minute.
+                self.playlist_song_keys.remove(&playlist_id);
                 if let Some(rows) = self.repeated_rows_to_remove(&playlist_id, &uris, &positions) {
                     self.remove_playlist_rows(playlist_id, rows);
                     return;
@@ -13989,6 +14086,17 @@ fn cover_error(locale: Locale, error: &crate::api::client::ApiError) -> String {
         _ => gettext(locale, "Couldn't upload the cover: {error}. Try again.")
             .replace("{error}", &error.to_string()),
     }
+}
+
+/// What [`App::playlist_has_songs`] knows of one playlist.
+#[derive(Default)]
+struct PlaylistSongKeys {
+    /// The snapshot `keys` were read at.
+    snapshot: Option<String>,
+    keys: Option<HashSet<String>>,
+    /// Songs added here, kept while Spotify's reads catch up.
+    added: HashSet<String>,
+    loading: bool,
 }
 
 /// Row indices of songs that appear more than once, by [`PlayableItem::song_key`].
@@ -26327,6 +26435,53 @@ mod tests {
             Some(named("spotify:track:d", "Honey", "Someone else")),
         ];
         assert_eq!(duplicate_groups(&rows), vec![vec![0, 3, 4]]);
+    }
+
+    #[test]
+    fn picker_marks_playlists_holding_the_song_by_duplicate_rule() {
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        let honey = named("spotify:track:new", "Honey", "Ari");
+        assert_eq!(
+            app.playlist_has_songs("pl", std::slice::from_ref(&honey)),
+            None
+        );
+
+        app.playlist_song_keys.insert(
+            "pl".into(),
+            PlaylistSongKeys {
+                loading: true,
+                ..Default::default()
+            },
+        );
+        let keys =
+            HashSet::from(
+                [named("spotify:track:old", "Honey - Remastered 2011", "Ari").song_key()],
+            );
+        app.handle_api(ApiResponse::PlaylistSongKeys {
+            playlist_id: "pl".into(),
+            snapshot_id: Some("s1".into()),
+            result: Ok(keys.clone()),
+        });
+        // A remaster counts as the same song; a live version does not.
+        assert_eq!(
+            app.playlist_has_songs("pl", std::slice::from_ref(&honey)),
+            Some(true)
+        );
+        let live = named("spotify:track:live", "Honey - Live", "Ari");
+        assert_eq!(
+            app.playlist_has_songs("pl", std::slice::from_ref(&live)),
+            Some(false)
+        );
+
+        // A song added here stays marked when a lagging re-read lacks it.
+        app.add_to_playlist_now("pl".into(), "Pl".into(), vec![live.clone()], None);
+        app.handle_api(ApiResponse::PlaylistSongKeys {
+            playlist_id: "pl".into(),
+            snapshot_id: Some("s2".into()),
+            result: Ok(keys),
+        });
+        assert_eq!(app.playlist_has_songs("pl", &[live, honey]), Some(true));
     }
 
     #[test]

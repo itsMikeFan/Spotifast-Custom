@@ -256,6 +256,11 @@ pub enum ApiRequest {
         uris: Vec<String>,
         position: Option<u32>,
     },
+    /// Read every row of a playlist for the Add to playlist picker's marks.
+    PlaylistSongKeys {
+        playlist_id: String,
+        snapshot_id: Option<String>,
+    },
     /// Read every row of a playlist to list its duplicate songs.
     FindPlaylistDuplicates {
         playlist_id: String,
@@ -527,6 +532,11 @@ pub enum ApiResponse {
         playlist_id: String,
         playlist_name: String,
         result: ApiResult<Vec<Option<PlayableItem>>>,
+    },
+    PlaylistSongKeys {
+        playlist_id: String,
+        snapshot_id: Option<String>,
+        result: ApiResult<std::collections::HashSet<String>>,
     },
     PlaylistItemsChanged {
         id: String,
@@ -4949,6 +4959,9 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         }
         | ApiRequest::FindPlaylistDuplicates {
             playlist_id: id, ..
+        }
+        | ApiRequest::PlaylistSongKeys {
+            playlist_id: id, ..
         } => Operation::PlaylistItems(api.playlist_access(id)),
         ApiRequest::UploadPlaylistCover { id, .. }
         | ApiRequest::UpdatePlaylist { id, .. }
@@ -5577,6 +5590,15 @@ async fn handle(
             playlist_name,
             items,
             position,
+        },
+        ApiRequest::PlaylistSongKeys {
+            playlist_id,
+            snapshot_id,
+        } => ApiResponse::PlaylistSongKeys {
+            result: routed!(all_playlist_items(&playlist_id))
+                .map(|rows| rows.iter().flatten().map(PlayableItem::song_key).collect()),
+            playlist_id,
+            snapshot_id,
         },
         ApiRequest::FindPlaylistDuplicates {
             playlist_id,
