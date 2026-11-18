@@ -654,6 +654,53 @@ impl PlayableItem {
     pub fn is_track(&self) -> bool {
         matches!(self, Self::Track(_))
     }
+
+    /// Identity for duplicate checks: the same song name by the same lead
+    /// artist, so a reupload on another album counts as the same song.
+    /// Case, spacing and remaster tags are ignored; "Live" or "Edit" versions
+    /// stay distinct because they are different recordings.
+    pub fn song_key(&self) -> String {
+        let normal = |text: &str| {
+            text.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        };
+        match self {
+            Self::Track(track) if track.name.trim().is_empty() => track.uri.clone(),
+            Self::Track(track) => format!(
+                "{}\u{1f}{}",
+                without_remaster(&normal(&track.name)),
+                track
+                    .artists
+                    .first()
+                    .map(|artist| normal(&artist.name))
+                    .unwrap_or_default()
+            ),
+            Self::Episode(episode) => episode.uri.clone(),
+        }
+    }
+}
+
+/// Drops "- Remastered 2011" suffixes and "(2009 Remaster)" or "[Remastered]"
+/// groups from a lowercase song name.
+fn without_remaster(name: &str) -> String {
+    let mut rest = match name.find(" - ") {
+        Some(dash) if name[dash..].contains("remaster") => &name[..dash],
+        _ => name,
+    };
+    let mut kept = String::new();
+    while let Some(start) = rest.find(['(', '['])
+        && let Some(end) = rest[start..].find([')', ']']).map(|end| start + end)
+    {
+        kept.push_str(&rest[..start]);
+        if !rest[start..end].contains("remaster") {
+            kept.push_str(&rest[start..=end]);
+        }
+        rest = &rest[end + 1..];
+    }
+    kept.push_str(rest);
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// An entry in a playlist. `item` is the 2026 name, `track` the classic one.

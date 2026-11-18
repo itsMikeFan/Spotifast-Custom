@@ -1086,6 +1086,17 @@ pub enum Dialog {
         position: Option<u32>,
         duplicate_uris: Vec<String>,
     },
+    /// Duplicate songs found in a playlist, for picking which rows to remove.
+    PlaylistDuplicates {
+        playlist_id: String,
+        playlist_name: String,
+        /// Every playlist row in order, as read when the dialog opened.
+        rows: Vec<Option<PlayableItem>>,
+        /// Row indices sharing a song, each group in playlist order.
+        groups: Vec<Vec<usize>>,
+        /// Row indices ticked for removal.
+        remove: std::collections::BTreeSet<usize>,
+    },
     Shortcuts,
     /// The signed-in account is not Premium, so nothing will play.
     PremiumNeeded,
@@ -1236,6 +1247,16 @@ pub enum Action {
         /// the view knows them; empty otherwise. With them, a song the list
         /// holds more than once loses only the picked copies.
         positions: Vec<u32>,
+    },
+    FindPlaylistDuplicates {
+        playlist_id: String,
+        playlist_name: String,
+    },
+    /// Remove the rows at `remove` from a playlist whose rows were `rows`.
+    RemovePlaylistDuplicates {
+        playlist_id: String,
+        rows: Vec<String>,
+        remove: std::collections::BTreeSet<usize>,
     },
     MoveInPlaylist {
         playlist_id: String,

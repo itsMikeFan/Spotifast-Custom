@@ -7775,6 +7775,38 @@ impl App {
                     self.add_to_playlist_now(playlist_id, playlist_name, items, position);
                 }
             },
+            ApiResponse::PlaylistDuplicatesFound {
+                playlist_id,
+                playlist_name,
+                result,
+            } => {
+                self.playlist_busy = false;
+                match result {
+                    Ok(rows) if duplicate_groups(&rows).is_empty() => {
+                        self.toast(gettext(self.locale, "No duplicate songs found"));
+                    }
+                    Ok(rows) => {
+                        let groups = duplicate_groups(&rows);
+                        // Keep the first copy of each song unless told otherwise.
+                        let remove = groups
+                            .iter()
+                            .flat_map(|group| group[1..].iter().copied())
+                            .collect();
+                        self.dialog = Some(Dialog::PlaylistDuplicates {
+                            playlist_id,
+                            playlist_name,
+                            rows,
+                            groups,
+                            remove,
+                        });
+                    }
+                    Err(error) => self.toast_error(
+                        // Translators: {error} is an error message.
+                        gettext(self.locale, "Couldn't read the playlist: {error}")
+                            .replace("{error}", &error.to_string()),
+                    ),
+                }
+            }
             ApiResponse::PlaylistItemsChanged {
                 id,
                 message,
@@ -10434,19 +10466,19 @@ impl App {
     /// only when the whole playlist is present.
     fn local_playlist_duplicates(&self, id: &str, items: &[PlayableItem]) -> Option<Vec<String>> {
         let page = self.playlist_pages.get(id)?;
-        let existing: HashSet<&str> = page
+        let existing: HashSet<String> = page
             .items
             .items
             .iter()
             .filter_map(PlaylistItem::playable)
-            .map(PlayableItem::uri)
-            .chain(page.local_additions.iter().map(String::as_str))
+            .map(PlayableItem::song_key)
             .collect();
         let duplicates: Vec<String> = items
             .iter()
-            .map(PlayableItem::uri)
-            .filter(|uri| existing.contains(*uri))
-            .map(str::to_string)
+            .filter(|item| {
+                existing.contains(&item.song_key()) || page.local_additions.contains(item.uri())
+            })
+            .map(|item| item.uri().to_string())
             .collect();
         if !duplicates.is_empty() || page.items.is_complete() {
             Some(duplicates)
@@ -11363,6 +11395,64 @@ impl App {
                 self.backend.api(ApiRequest::RemoveFromPlaylist {
                     playlist_id,
                     uris,
+                    snapshot_id,
+                });
+            }
+            Action::FindPlaylistDuplicates {
+                playlist_id,
+                playlist_name,
+            } => {
+                self.playlist_busy = true;
+                self.backend.api(ApiRequest::FindPlaylistDuplicates {
+                    playlist_id,
+                    playlist_name,
+                });
+            }
+            Action::RemovePlaylistDuplicates {
+                playlist_id,
+                rows,
+                remove,
+            } => {
+                self.dialog = None;
+                if remove.is_empty() {
+                    return;
+                }
+                let (uris, readd) = dedupe_plan(&rows, &remove);
+                let snapshot_id = self
+                    .playlist_pages
+                    .get(&playlist_id)
+                    .and_then(|page| page.playlist.get())
+                    .and_then(|playlist| playlist.snapshot_id.clone());
+                self.prepare_playlist_mutation(&playlist_id);
+                if let Some(page) = self.playlist_pages.get_mut(&playlist_id) {
+                    // Drop exactly the picked rows that are loaded, by position.
+                    let base = page.items.base_offset as usize;
+                    let mut index = base;
+                    page.items.retain(|item| {
+                        let position = index;
+                        index += 1;
+                        !(remove.contains(&position)
+                            && item.playable().map(PlayableItem::uri)
+                                == rows.get(position).map(String::as_str))
+                    });
+                    let removed = remove.len() as u32;
+                    page.items.total = page.items.total.map(|total| total.saturating_sub(removed));
+                    page.items.next_offset = page
+                        .items
+                        .next_offset
+                        .map(|offset| offset.saturating_sub(removed));
+                    if let Loadable::Loaded(playlist) = &mut page.playlist
+                        && let Some(count) =
+                            playlist.items_count.as_mut().or(playlist.tracks.as_mut())
+                    {
+                        count.total = count.total.saturating_sub(removed);
+                    }
+                }
+                self.playlist_busy = true;
+                self.backend.api(ApiRequest::RemovePlaylistDuplicates {
+                    playlist_id,
+                    uris,
+                    readd,
                     snapshot_id,
                 });
             }
@@ -13769,6 +13859,56 @@ fn cover_error(locale: Locale, error: &crate::api::client::ApiError) -> String {
         _ => gettext(locale, "Couldn't upload the cover: {error}. Try again.")
             .replace("{error}", &error.to_string()),
     }
+}
+
+/// Row indices of songs that appear more than once, by [`PlayableItem::song_key`].
+pub(crate) fn duplicate_groups(rows: &[Option<PlayableItem>]) -> Vec<Vec<usize>> {
+    let mut by_key: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut order = Vec::new();
+    for (index, item) in rows.iter().enumerate() {
+        let Some(item) = item.as_ref().filter(|item| !item.uri().is_empty()) else {
+            continue;
+        };
+        let key = item.song_key();
+        let group = by_key.entry(key.clone()).or_default();
+        if group.is_empty() {
+            order.push(key);
+        }
+        group.push(index);
+    }
+    order
+        .into_iter()
+        .filter_map(|key| by_key.remove(&key))
+        .filter(|group| group.len() > 1)
+        .collect()
+}
+
+/// Spotify removes every copy of a URI at once. To remove only the picked
+/// rows, remove each picked URI entirely and put back its kept copies:
+/// returns the URIs to remove and `(uri, final position)` to re-add, ascending.
+pub(crate) fn dedupe_plan(
+    rows: &[String],
+    remove: &std::collections::BTreeSet<usize>,
+) -> (Vec<String>, Vec<(String, u32)>) {
+    let mut uris: Vec<String> = Vec::new();
+    for &index in remove {
+        if let Some(uri) = rows.get(index).filter(|uri| !uri.is_empty())
+            && !uris.contains(uri)
+        {
+            uris.push(uri.clone());
+        }
+    }
+    let mut readd = Vec::new();
+    let mut position = 0;
+    for (index, uri) in rows.iter().enumerate() {
+        if !uris.contains(uri) {
+            position += 1;
+        } else if !remove.contains(&index) {
+            readd.push((uri.clone(), position));
+            position += 1;
+        }
+    }
+    (uris, readd)
 }
 
 mod radio;
@@ -25876,6 +26016,80 @@ mod tests {
             1,
             "a successful write does not throw away the loaded playlist"
         );
+    }
+
+    fn named(uri: &str, name: &str, artist: &str) -> PlayableItem {
+        PlayableItem::Track(Track {
+            uri: uri.into(),
+            name: name.into(),
+            artists: vec![crate::api::models::ArtistRef {
+                name: artist.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn a_reupload_with_the_same_name_and_artist_is_a_duplicate() {
+        let mut app = headless_app();
+        app.backend.set_offline(true);
+        app.playlist_pages.insert(
+            "best".into(),
+            PlaylistPage {
+                items: PagedList {
+                    items: vec![crate::api::models::PlaylistItem {
+                        item: Some(named("spotify:track:single", "Honey", "Ari")),
+                        ..Default::default()
+                    }],
+                    total: Some(1),
+                    next_offset: None,
+                    loaded_once: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let album = named("spotify:track:album", "  honey ", "ARI");
+        let live = named("spotify:track:live", "Honey (Live)", "Ari");
+        let edit = named("spotify:track:edit", "Honey - Radio Edit", "Ari");
+        let remaster = named("spotify:track:rm", "Honey - Remastered 2011", "Ari");
+        let bracketed = named("spotify:track:rm2", "Honey [2009 Remaster]", "Ari");
+        assert_eq!(
+            app.local_playlist_duplicates("best", &[album, live, edit, remaster, bracketed]),
+            Some(vec![
+                "spotify:track:album".to_string(),
+                "spotify:track:rm".to_string(),
+                "spotify:track:rm2".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_groups_follow_playlist_order_and_skip_unique_songs() {
+        let rows = vec![
+            Some(named("spotify:track:a", "Honey", "Ari")),
+            None,
+            Some(named("spotify:track:b", "Other", "Ari")),
+            Some(named("spotify:track:c", "HONEY", "ari")),
+            Some(named("spotify:track:a", "Honey", "Ari")),
+            Some(named("spotify:track:d", "Honey", "Someone else")),
+        ];
+        assert_eq!(duplicate_groups(&rows), vec![vec![0, 3, 4]]);
+    }
+
+    #[test]
+    fn dedupe_plan_puts_back_kept_copies_of_a_removed_uri() {
+        let rows: Vec<String> = ["a", "b", "a", "c", "a"].map(String::from).to_vec();
+        // Remove the copy at 2: Spotify drops every "a", so 0 and 4 come back.
+        let (uris, readd) = dedupe_plan(&rows, &[2].into());
+        assert_eq!(uris, ["a"]);
+        // Final list: a b c a.
+        assert_eq!(readd, [("a".to_string(), 0), ("a".to_string(), 3)]);
+        // A reupload with its own URI needs nothing put back.
+        let (uris, readd) = dedupe_plan(&rows, &[1].into());
+        assert_eq!(uris, ["b"]);
+        assert!(readd.is_empty());
     }
 
     #[test]

@@ -256,6 +256,18 @@ pub enum ApiRequest {
         uris: Vec<String>,
         position: Option<u32>,
     },
+    /// Read every row of a playlist to list its duplicate songs.
+    FindPlaylistDuplicates {
+        playlist_id: String,
+        playlist_name: String,
+    },
+    /// Remove every copy of `uris`, then put back `readd` at final positions.
+    RemovePlaylistDuplicates {
+        playlist_id: String,
+        uris: Vec<String>,
+        readd: Vec<(String, u32)>,
+        snapshot_id: Option<String>,
+    },
     RemoveFromPlaylist {
         playlist_id: String,
         uris: Vec<String>,
@@ -510,6 +522,11 @@ pub enum ApiResponse {
         items: Vec<PlayableItem>,
         position: Option<u32>,
         result: ApiResult<Vec<String>>,
+    },
+    PlaylistDuplicatesFound {
+        playlist_id: String,
+        playlist_name: String,
+        result: ApiResult<Vec<Option<PlayableItem>>>,
     },
     PlaylistItemsChanged {
         id: String,
@@ -4929,6 +4946,9 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         | ApiRequest::PlaylistSample { id, .. }
         | ApiRequest::CheckPlaylistDuplicates {
             playlist_id: id, ..
+        }
+        | ApiRequest::FindPlaylistDuplicates {
+            playlist_id: id, ..
         } => Operation::PlaylistItems(api.playlist_access(id)),
         ApiRequest::UploadPlaylistCover { id, .. }
         | ApiRequest::UpdatePlaylist { id, .. }
@@ -4937,6 +4957,7 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         }
         ApiRequest::AddToPlaylist { playlist_id, .. }
         | ApiRequest::RemoveFromPlaylist { playlist_id, .. }
+        | ApiRequest::RemovePlaylistDuplicates { playlist_id, .. }
         | ApiRequest::ReorderPlaylist { playlist_id, .. } => {
             Operation::PlaylistMutation(api.playlist_access(playlist_id))
         }
@@ -5005,6 +5026,11 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
             ..
         }
         | ApiResponse::PlaylistDuplicatesChecked {
+            playlist_id: id,
+            result: Err(error),
+            ..
+        }
+        | ApiResponse::PlaylistDuplicatesFound {
             playlist_id: id,
             result: Err(error),
             ..
@@ -5545,16 +5571,36 @@ async fn handle(
             playlist_name,
             items,
             position,
-        } => {
-            let uris: Vec<String> = items.iter().map(|item| item.uri().to_string()).collect();
-            ApiResponse::PlaylistDuplicatesChecked {
-                result: routed!(playlist_duplicates(&playlist_id, &uris)),
-                playlist_id,
-                playlist_name,
-                items,
-                position,
-            }
-        }
+        } => ApiResponse::PlaylistDuplicatesChecked {
+            result: routed!(playlist_duplicates(&playlist_id, &items)),
+            playlist_id,
+            playlist_name,
+            items,
+            position,
+        },
+        ApiRequest::FindPlaylistDuplicates {
+            playlist_id,
+            playlist_name,
+        } => ApiResponse::PlaylistDuplicatesFound {
+            result: routed!(all_playlist_items(&playlist_id)),
+            playlist_id,
+            playlist_name,
+        },
+        ApiRequest::RemovePlaylistDuplicates {
+            playlist_id,
+            uris,
+            readd,
+            snapshot_id,
+        } => ApiResponse::PlaylistItemsChanged {
+            result: routed!(remove_playlist_duplicates(
+                &playlist_id,
+                &uris,
+                &readd,
+                snapshot_id.as_deref()
+            )),
+            id: playlist_id,
+            message: "Removed duplicates".to_string(),
+        },
         ApiRequest::AddToPlaylist {
             playlist_id,
             playlist_name,

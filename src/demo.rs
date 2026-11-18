@@ -8206,6 +8206,16 @@ mod tests {
                 items: vec![PlayableItem::Track(track(1))],
                 duplicate_uris: vec!["spotify:track:trk1".into()],
             },
+            Dialog::PlaylistDuplicates {
+                playlist_id: "pl1".into(),
+                playlist_name: "x".into(),
+                rows: vec![
+                    Some(PlayableItem::Track(track(1))),
+                    Some(PlayableItem::Track(track(1))),
+                ],
+                groups: vec![vec![0, 1]],
+                remove: [1].into(),
+            },
         ] {
             app.dialog = Some(dialog);
             frame(&ctx, &mut app);

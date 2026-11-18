@@ -123,7 +123,14 @@ apps. `Ctrl+V` (`Cmd+V`) in a playlist you can edit adds every song link on
 the clipboard to its end. Links copied from Spotifast add their rows at
 once; links from elsewhere appear as soon as Spotify names the songs. Songs
 already in the playlist ask before being added twice, and links that are
-not songs, such as albums, are skipped.
+not songs, such as albums, are skipped. A song counts as already there when
+its name (ignoring case, spacing and "Remastered" tags) and lead artist match,
+so the same song released on another album is caught too. Live versions and
+edits count as different songs.
+
+**Find duplicates** in the menu of a playlist you own lists every song that
+appears more than once and ticks all but the first copy. Untick what you want
+to keep and select **Remove**.
 
 `Ctrl+X` (`Cmd+X`) in a playlist you can edit copies the selected songs'
 links the same way and removes the songs from the playlist, so `Ctrl+V` in

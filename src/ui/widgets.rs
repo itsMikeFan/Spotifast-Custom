@@ -1269,6 +1269,17 @@ pub fn context_menu_items(
                 public: playlist.public,
             }));
         }
+        if menu_item(
+            ui,
+            &palette,
+            Some(Icon::Copy),
+            &gettext(locale, "Find duplicates"),
+        ) {
+            app.actions.push(Action::FindPlaylistDuplicates {
+                playlist_id: playlist.id.clone(),
+                playlist_name: playlist.name.clone(),
+            });
+        }
         if menu_item(ui, &palette, Some(Icon::Trash), &gettext(locale, "Delete")) {
             app.actions
                 .push(Action::ShowDialog(Dialog::ConfirmDeletePlaylist {
