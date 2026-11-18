@@ -7761,20 +7761,21 @@ impl App {
             ApiResponse::PlaylistUpdated { id, result } => {
                 self.playlist_busy = false;
                 match result {
-                    Ok(()) => {
-                        self.toast(gettext(self.locale, "Playlist updated"));
-                        self.playlist_pages.remove(&id);
-                        self.load_playlists();
-                        if matches!(self.page(), Page::Playlist(current) if *current == id) {
-                            self.ensure_loaded(Page::Playlist(id));
-                        }
-                    }
+                    // The change is already shown; reading it back now would
+                    // get Spotify's answer from before it.
+                    Ok(()) => self.toast(gettext(self.locale, "Playlist updated")),
                     Err(error) => {
                         self.toast_error(
                             // Translators: {error} is an error message.
                             gettext(self.locale, "Couldn't update the playlist: {error}")
                                 .replace("{error}", &error.to_string()),
-                        )
+                        );
+                        // Undo what was shown by reading Spotify's details again.
+                        self.playlist_pages.remove(&id);
+                        self.load_playlists();
+                        if matches!(self.page(), Page::Playlist(current) if *current == id) {
+                            self.ensure_loaded(Page::Playlist(id));
+                        }
                     }
                 }
             }
@@ -11663,6 +11664,30 @@ impl App {
                     || changes.public.is_some()
                 {
                     self.playlist_busy = true;
+                    // Shown at once: Spotify's reads lag the change, and
+                    // reading it back undid the switch on screen.
+                    let page = self
+                        .playlist_pages
+                        .get_mut(&id)
+                        .and_then(|page| page.playlist.get_mut());
+                    let listed = self
+                        .library
+                        .playlists
+                        .get_mut()
+                        .into_iter()
+                        .flat_map(|playlists| playlists.iter_mut().filter(|p| p.id == id));
+                    for playlist in page.into_iter().chain(listed) {
+                        if let Some(name) = &changes.name {
+                            playlist.name.clone_from(name);
+                        }
+                        if let Some(description) = &changes.description {
+                            playlist.description = Some(description.clone());
+                        }
+                        if let Some(public) = changes.public {
+                            playlist.public = Some(public);
+                        }
+                    }
+                    self.store_library_cache();
                     self.backend.api(ApiRequest::UpdatePlaylist {
                         id,
                         name: changes.name,
@@ -14877,6 +14902,45 @@ mod tests {
         assert_eq!(save(&mut app, Some(false)), Some(false));
     }
 
+    /// A playlist made private shows as private at once and stays so when
+    /// Spotify confirms; reading it back would get the old answer.
+    #[test]
+    fn making_a_playlist_private_shows_at_once() {
+        let mut app = headless_app();
+        let ctx = egui::Context::default();
+        let public_playlist = Playlist {
+            id: "pl1".into(),
+            name: "Mine".into(),
+            public: Some(true),
+            ..Default::default()
+        };
+        app.library.playlists = Loadable::Loaded(vec![public_playlist.clone()]);
+        app.playlist_pages.insert(
+            "pl1".into(),
+            PlaylistPage {
+                playlist: Loadable::Loaded(public_playlist),
+                ..Default::default()
+            },
+        );
+        app.apply(
+            Action::UpdatePlaylist {
+                id: "pl1".into(),
+                name: "Mine".into(),
+                description: String::new(),
+                public: Some(false),
+            },
+            &ctx,
+        );
+        app.handle_api(ApiResponse::PlaylistUpdated {
+            id: "pl1".into(),
+            result: Ok(()),
+        });
+        let shown = app.playlist_pages["pl1"].playlist.get().unwrap().public;
+        assert_eq!(shown, Some(false));
+        let listed = app.library.playlists.get().unwrap()[0].public;
+        assert_eq!(listed, Some(false));
+    }
+
     /// Saving sends only what the dialog changed. Spotify refuses an empty
     /// description, so clearing one keeps it and says why instead of
     /// failing a rename saved at the same time.
@@ -15115,14 +15179,16 @@ mod tests {
     fn saving_playlist_details_sends_only_what_changed() {
         let mut app = headless_app();
         let ctx = egui::Context::default();
-        app.library.playlists = Loadable::Loaded(vec![Playlist {
-            id: "pl1".into(),
-            name: "Mix".into(),
-            description: Some("<b>Old</b> notes".into()),
-            public: Some(true),
-            ..Playlist::default()
-        }]);
         let save = |app: &mut App, name: &str, description: &str, public| {
+            // Each save starts from the same playlist; a save shows its own
+            // change at once, which would otherwise carry into the next.
+            app.library.playlists = Loadable::Loaded(vec![Playlist {
+                id: "pl1".into(),
+                name: "Mix".into(),
+                description: Some("<b>Old</b> notes".into()),
+                public: Some(true),
+                ..Playlist::default()
+            }]);
             app.apply(
                 Action::UpdatePlaylist {
                     id: "pl1".into(),

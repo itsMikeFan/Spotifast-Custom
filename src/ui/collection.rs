@@ -2135,6 +2135,8 @@ fn playlist_hero<'a>(
                 gettext(app.locale, "Collaborative Playlist")
             } else if playlist.public == Some(true) {
                 gettext(app.locale, "Public Playlist")
+            } else if playlist.public == Some(false) {
+                gettext(app.locale, "Private Playlist")
             } else {
                 gettext(app.locale, "Playlist")
             },
