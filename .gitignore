@@ -1,0 +1,15 @@
+# Personal runtime data: login tokens, session, listening history, logs
+spotifast-data/state/
+spotifast-data/cache/
+# settings.json holds search history, pinned playlists and a client id
+spotifast-data/config/settings.json
+*.log
+*.sealed
+
+# Large binaries: built app (publish via GitHub Releases) and third-party MilkDrop presets
+*.exe
+spotifast-data/config/milkdrop/
+
+# OS junk
+Thumbs.db
+desktop.ini
