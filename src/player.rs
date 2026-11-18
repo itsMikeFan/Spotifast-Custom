@@ -801,6 +801,14 @@ impl Engine {
             },
             PlayerCommand::Transfer => spirc.transfer(None)?,
             PlayerCommand::Load(spec) => {
+                // librespot resolves the whole context before it fetches the
+                // song. Fetching the song now runs both at once, and the load
+                // then takes the preloaded song instead of starting over.
+                if let Some(uri) =
+                    starting_track(&spec).and_then(|uri| SpotifyUri::from_uri(uri).ok())
+                {
+                    self.player.preload(uri);
+                }
                 let playing_track = spec
                     .offset_uri
                     .clone()
@@ -829,6 +837,22 @@ impl Engine {
         }
         Ok(())
     }
+}
+
+/// The song a load starts with, when the request names it.
+fn starting_track(spec: &LoadSpec) -> Option<&str> {
+    if spec.autoplay {
+        return None;
+    }
+    let named = match (&spec.offset_uri, spec.offset_index, &spec.context_uri) {
+        (Some(uri), _, _) => uri.as_str(),
+        (None, Some(index), None) => spec.uris.get(index as usize)?.as_str(),
+        (None, None, None) => spec.uris.first()?.as_str(),
+        // A single song loads as its own context.
+        (None, None, Some(context)) => context.as_str(),
+        (None, Some(_), Some(_)) => return None,
+    };
+    named.starts_with("spotify:track:").then_some(named)
 }
 
 /// What to pick up: `resume` as it was when the session dropped, or where a
@@ -1863,6 +1887,44 @@ mod tests {
             assert!(!state.loading, "failure {failure} stops the spinner");
             assert!(state.error.is_some(), "failure {failure} reports why");
         }
+    }
+
+    #[test]
+    fn a_load_names_the_song_it_starts_with() {
+        let song = "spotify:track:a";
+        let in_playlist = LoadSpec {
+            context_uri: Some("spotify:playlist:p".into()),
+            offset_uri: Some(song.into()),
+            ..LoadSpec::default()
+        };
+        assert_eq!(starting_track(&in_playlist), Some(song));
+        let single = LoadSpec {
+            context_uri: Some(song.into()),
+            ..LoadSpec::default()
+        };
+        assert_eq!(starting_track(&single), Some(song));
+        let list = LoadSpec {
+            uris: vec!["spotify:track:x".into(), song.into()],
+            offset_index: Some(1),
+            ..LoadSpec::default()
+        };
+        assert_eq!(starting_track(&list), Some(song));
+        let unnamed = LoadSpec {
+            context_uri: Some("spotify:playlist:p".into()),
+            offset_index: Some(3),
+            ..LoadSpec::default()
+        };
+        assert_eq!(starting_track(&unnamed), None);
+        let whole_playlist = LoadSpec {
+            context_uri: Some("spotify:playlist:p".into()),
+            ..LoadSpec::default()
+        };
+        assert_eq!(starting_track(&whole_playlist), None);
+        let episode = LoadSpec {
+            uris: vec!["spotify:episode:e".into()],
+            ..LoadSpec::default()
+        };
+        assert_eq!(starting_track(&episode), None, "only songs are preloaded");
     }
 
     #[test]
