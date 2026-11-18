@@ -845,6 +845,8 @@ pub struct PlaylistPage {
     pub playlist: Loadable<Playlist>,
     pub items: PagedList<PlaylistItem>,
     pub filter: String,
+    /// The page lists only the songs Spotify says are unavailable.
+    pub unavailable_only: bool,
     /// Contributor IDs from loaded pages and a sample of the final page.
     pub contributors: std::collections::BTreeSet<String>,
     /// Whether contributors were sampled from the final page.

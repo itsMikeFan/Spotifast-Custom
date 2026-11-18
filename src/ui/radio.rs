@@ -176,6 +176,7 @@ pub fn radio(app: &mut App, ui: &mut egui::Ui, seed: &str) {
             filter: "",
             items_revision: generation,
             plays_shown_rows: false,
+            unavailable_only: false,
         },
     );
 }
