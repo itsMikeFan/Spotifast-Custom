@@ -13,3 +13,20 @@ spotifast-data/config/milkdrop/
 # OS junk
 Thumbs.db
 desktop.ini
+
+# Upstream source ignores
+/target/
+**/target/
+.idea/
+.vscode/
+/examples/token_probe.rs
+/examples/oauth_probe.rs
+docs/_site/
+docs/.jekyll-cache/
+docs/vendor/
+docs/.bundle/
+.claude/
+
+/.cache/
+
+/dist/
