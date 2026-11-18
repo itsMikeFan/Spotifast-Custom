@@ -536,6 +536,9 @@ pub struct App {
     playlist_headers: HashMap<String, Playlist>,
     /// Blank library playlists already asked about.
     playlist_headers_requested: HashSet<String>,
+    /// Playlists just created here and filled from rows this app showed,
+    /// until their songs are added.
+    fresh_playlists: HashSet<String>,
     /// Album URIs positively identified as EPs by librespot.
     confirmed_ep_albums: HashSet<String>,
     /// Built table rows, keyed by page. Capped; dropped on reset and eviction.
@@ -1185,6 +1188,7 @@ impl App {
             audiobooks_requested: HashSet::new(),
             playlist_headers: HashMap::new(),
             playlist_headers_requested: HashSet::new(),
+            fresh_playlists: HashSet::new(),
             confirmed_ep_albums: HashSet::new(),
             table_rows: HashMap::new(),
             page_used: HashMap::new(),
@@ -7654,17 +7658,43 @@ impl App {
                         });
                         self.saved.insert(playlist.uri.clone(), true);
                         self.store_library_cache();
-                        if let Some(Dialog::CreatePlaylist { add_uris, .. }) = self.dialog.take()
-                            && !add_uris.is_empty()
-                        {
+                        let add_uris = match self.dialog.take() {
+                            Some(Dialog::CreatePlaylist { add_uris, .. }) => add_uris,
+                            _ => Vec::new(),
+                        };
+                        // The new playlist is empty until the songs below are
+                        // added, so it is shown at once from what this app
+                        // knows instead of from Spotify's lagging reads.
+                        let items: Option<Vec<PlayableItem>> =
+                            add_uris.iter().map(|uri| self.shown_item(uri)).collect();
+                        if let Some(items) = items {
+                            self.playlist_pages.insert(
+                                playlist.id.clone(),
+                                PlaylistPage {
+                                    playlist: Loadable::Loaded(playlist.clone()),
+                                    items: PagedList {
+                                        total: Some(0),
+                                        next_offset: None,
+                                        loaded_once: true,
+                                        ..PagedList::default()
+                                    },
+                                    ..PlaylistPage::default()
+                                },
+                            );
+                            if !items.is_empty() {
+                                self.fresh_playlists.insert(playlist.id.clone());
+                            }
+                            self.open(Page::Playlist(playlist.id.clone()));
+                            self.add_to_playlist_now(playlist.id, playlist.name, items, None);
+                        } else {
                             self.backend.api(ApiRequest::AddToPlaylist {
                                 playlist_id: playlist.id.clone(),
                                 playlist_name: playlist.name.clone(),
                                 uris: add_uris,
                                 position: None,
                             });
+                            self.open(Page::Playlist(playlist.id));
                         }
-                        self.open(Page::Playlist(playlist.id));
                     }
                     Err(error) => {
                         self.toast_error(
@@ -7816,6 +7846,7 @@ impl App {
                 if let Some(page) = self.playlist_pages.get_mut(&id) {
                     page.pending_writes = page.pending_writes.saturating_sub(1);
                 }
+                let fresh = self.fresh_playlists.remove(&id);
                 match result {
                     Ok(snapshot) => {
                         if !message.is_empty() {
@@ -7826,11 +7857,15 @@ impl App {
                             if let Some(playlist) = page.playlist.get_mut() {
                                 playlist.snapshot_id = snapshot.clone();
                             }
-                            if snapshot.is_some() {
-                                page.optimistic_snapshot = snapshot.clone();
-                                page.snapshot_rechecks = 0;
+                            // A new playlist's rows all came from here, and
+                            // Spotify's reads would only report it empty.
+                            if !fresh {
+                                if snapshot.is_some() {
+                                    page.optimistic_snapshot = snapshot.clone();
+                                    page.snapshot_rechecks = 0;
+                                }
+                                generation = Some(page.generation);
                             }
-                            generation = Some(page.generation);
                         }
                         if let Some(playlists) = self.library.playlists.get_mut() {
                             for playlist in playlists.iter_mut().filter(|p| p.id == id) {
@@ -10820,6 +10855,24 @@ impl App {
         }
         let id = uri.strip_prefix("spotify:track:")?;
         self.read_cached_track(id).map(PlayableItem::Track)
+    }
+
+    /// A song or episode this app has shown, by its URI: in a table, the
+    /// queue, or the song caches.
+    fn shown_item(&mut self, uri: &str) -> Option<PlayableItem> {
+        if let Some(item) = self.known_song(uri) {
+            return Some(item);
+        }
+        let queued = self
+            .queue
+            .get()
+            .into_iter()
+            .flat_map(|queue| queue.currently_playing.iter().chain(queue.queue.iter()));
+        let rows = self
+            .table_rows
+            .values()
+            .flat_map(|rows| rows.items.iter().map(|(item, _, _)| item));
+        queued.chain(rows).find(|item| item.uri() == uri).cloned()
     }
 
     /// Records Spotify's answer for a pasted song link: the song, or `None`
@@ -16673,6 +16726,57 @@ mod tests {
         })));
         assert_eq!(listed_playlists(&app), playlist_ids(&["n", "a", "b"]));
         assert!(stored_playlists(&app).is_empty());
+    }
+
+    /// A playlist created with songs shows them at once, and Spotify's
+    /// lagging read of the new playlist does not empty it again.
+    #[test]
+    fn a_new_playlist_shows_its_songs_at_once() {
+        let mut app = connected_listener();
+        store_track(&mut app, "a");
+        store_track(&mut app, "b");
+        app.dialog = Some(Dialog::CreatePlaylist {
+            name: "New".into(),
+            public: false,
+            add_uris: vec!["spotify:track:a".into(), "spotify:track:b".into()],
+        });
+        app.handle_api(ApiResponse::PlaylistCreated(Ok(Playlist {
+            id: "n".into(),
+            uri: "spotify:playlist:n".into(),
+            name: "New".into(),
+            items_count: Some(TrackCount { total: 0 }),
+            ..Playlist::default()
+        })));
+        let rows = |app: &App| -> Vec<String> {
+            app.playlist_pages["n"]
+                .items
+                .items
+                .iter()
+                .filter_map(|row| row.playable().map(|item| item.uri().to_string()))
+                .collect()
+        };
+        let expected = vec!["spotify:track:a".to_string(), "spotify:track:b".into()];
+        assert_eq!(rows(&app), expected);
+        assert_eq!(app.playlist_pages["n"].items.total, Some(2));
+
+        app.handle_api(ApiResponse::PlaylistItemsChanged {
+            id: "n".into(),
+            message: String::new(),
+            result: Ok(Some("written".into())),
+        });
+        assert_eq!(rows(&app), expected);
+        assert_eq!(
+            app.playlist_pages["n"].optimistic_snapshot, None,
+            "nothing waits on Spotify's read to catch up"
+        );
+        assert_eq!(
+            app.playlist_pages["n"]
+                .playlist
+                .get()
+                .unwrap()
+                .track_total(),
+            2
+        );
     }
 
     /// A Home refresh that failed behind cached shelves is read again when
