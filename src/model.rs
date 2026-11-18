@@ -1420,6 +1420,17 @@ pub enum Action {
     /// Windows: draw Spotifast's own title bar instead of the standard one.
     SetCustomTitlebar(bool),
     OpenSkinsFolder,
+    /// Pick songs from this PC to add to `playlist`, or one to stand in
+    /// for its unavailable song `replaces`.
+    ChooseLocalSongs {
+        playlist: String,
+        replaces: Option<String>,
+    },
+    /// Take the song from this PC `uri` out of `playlist`.
+    RemoveLocalSong {
+        playlist: String,
+        uri: String,
+    },
     /// Pick the folder a playlist's local files play from.
     ChooseLocalFilesFolder,
     /// Stop playing local files.

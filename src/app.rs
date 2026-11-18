@@ -677,6 +677,13 @@ pub struct App {
         std::path::PathBuf,
         std::sync::Arc<HashMap<String, std::path::PathBuf>>,
     )>,
+    /// Songs from this PC shown in playlists; Spotify cannot hold them.
+    pub local_songs: crate::local_songs::LocalSongs,
+    /// Changes whenever `local_songs` does, so playlist tables redraw.
+    pub local_songs_revision: u64,
+    /// The player learns of new files only when it starts: restart it once
+    /// nothing is playing.
+    local_songs_restart_due: bool,
     /// Requested shuffle mode, applied to every context until changed.
     shuffle_wanted: bool,
     /// The repeat mode saved by the last run, which the first local load
@@ -1274,6 +1281,9 @@ impl App {
             intent_track: None,
             played_row: None,
             local_files: None,
+            local_songs: crate::local_songs::LocalSongs::load(),
+            local_songs_revision: 0,
+            local_songs_restart_due: false,
             shuffle_wanted: session.shuffle_on,
             repeat_wanted: RepeatMode::from_api(&session.repeat),
             shuffle_set_at: None,
@@ -1345,9 +1355,8 @@ impl App {
             pixels_per_point: 1.0,
         };
         app.local.volume = app.settings.volume;
-        if let Some(folder) = app.settings.local_files_folder() {
-            app.backend.send(Command::ScanLocalFiles(folder));
-        }
+        app.backend
+            .send(Command::ScanLocalFiles(app.local_files_scan_folder()));
         // What was played here is on disk and needs nothing from the
         // network, so the tab has rows before Spotify has answered.
         app.rebuild_recents();
@@ -2476,6 +2485,11 @@ impl App {
     fn handle_events(&mut self) {
         let events = self.backend.poll();
         self.handle_backend_events(events);
+        // Restarting the player stops the music, so it waits for a pause.
+        if self.local_songs_restart_due && !self.believed_playing() {
+            self.local_songs_restart_due = false;
+            self.actions.push(Action::RestartEngine);
+        }
     }
 
     fn handle_backend_events(&mut self, events: Vec<Event>) {
@@ -2509,9 +2523,14 @@ impl App {
                     self.set_local_files_folder(Some(folder));
                 }
                 Event::LocalFilesFolderChosen(None) => {}
+                Event::LocalSongsImported {
+                    playlist,
+                    replaces,
+                    results,
+                } => self.local_songs_imported(playlist, replaces, results),
                 Event::LocalFiles { folder, uris } => {
                     // A scan of a folder since replaced says nothing now.
-                    if self.settings.local_files_folder().as_ref() == Some(&folder) {
+                    if self.local_files_scan_folder() == folder {
                         self.local_files = Some((folder, uris));
                     }
                 }
@@ -10599,10 +10618,60 @@ impl App {
             .as_ref()
             .map(|folder| folder.to_string_lossy().into_owned());
         self.local_files = None;
-        if let Some(folder) = folder {
-            self.backend.send(Command::ScanLocalFiles(folder));
-        }
+        self.backend
+            .send(Command::ScanLocalFiles(self.local_files_scan_folder()));
         self.actions.push(Action::RestartEngine);
+    }
+
+    /// The folder the local files scan starts from; the localsongs folder
+    /// is always read beside it.
+    fn local_files_scan_folder(&self) -> std::path::PathBuf {
+        self.settings
+            .local_files_folder()
+            .unwrap_or_else(crate::local_songs::dir)
+    }
+
+    fn save_local_songs(&mut self) {
+        self.local_songs_revision = self.local_songs_revision.wrapping_add(1);
+        if self.offline {
+            return;
+        }
+        if let Some(text) = self.local_songs.encode() {
+            self.files.write(
+                &crate::local_songs::list_file(),
+                text,
+                fastframe_file::Access::Default,
+            );
+        }
+    }
+
+    fn local_songs_imported(
+        &mut self,
+        playlist: String,
+        replaces: Option<String>,
+        results: Vec<Result<String, String>>,
+    ) {
+        let mut added = false;
+        for result in results {
+            match result {
+                Ok(uri) => {
+                    added |= self.local_songs.add(crate::local_songs::LocalSong {
+                        playlist: playlist.clone(),
+                        uri,
+                        replaces: replaces.clone(),
+                    });
+                }
+                Err(error) => self.toast_error(error),
+            }
+        }
+        if !added {
+            return;
+        }
+        self.save_local_songs();
+        self.local_files = None;
+        self.backend
+            .send(Command::ScanLocalFiles(self.local_files_scan_folder()));
+        self.local_songs_restart_due = true;
     }
 
     /// Whether the song at `uri` can be queued. Spotify's queue refuses a
@@ -11553,9 +11622,36 @@ impl App {
             }
             Action::RemoveFromPlaylist {
                 playlist_id,
-                uris,
-                positions,
+                mut uris,
+                mut positions,
             } => {
+                // Songs from this PC live only in Spotifast's own list.
+                let playlist_uri = format!("spotify:playlist:{playlist_id}");
+                if uris
+                    .iter()
+                    .any(|uri| self.local_songs.contains(&playlist_uri, uri))
+                {
+                    let keep: Vec<bool> = uris
+                        .iter()
+                        .map(|uri| !self.local_songs.remove(&playlist_uri, uri))
+                        .collect();
+                    self.save_local_songs();
+                    if positions.len() == keep.len() {
+                        positions = positions
+                            .into_iter()
+                            .zip(&keep)
+                            .filter_map(|(position, keep)| keep.then_some(position))
+                            .collect();
+                    }
+                    uris = uris
+                        .into_iter()
+                        .zip(&keep)
+                        .filter_map(|(uri, keep)| keep.then_some(uri))
+                        .collect();
+                    if uris.is_empty() {
+                        return;
+                    }
+                }
                 // shortcut: forget the playlist's marks and fall back to its open page;
                 // a re-read may still lag the removal by a minute.
                 self.playlist_song_keys.remove(&playlist_id);
@@ -12638,6 +12734,14 @@ impl App {
                 }
             }
             Action::OpenSkinsFolder => self.open_folder(self.dirs.skins_dir()),
+            Action::ChooseLocalSongs { playlist, replaces } => {
+                self.backend.choose_local_songs(playlist, replaces);
+            }
+            Action::RemoveLocalSong { playlist, uri } => {
+                if self.local_songs.remove(&playlist, &uri) {
+                    self.save_local_songs();
+                }
+            }
             Action::ChooseLocalFilesFolder => self.backend.choose_local_files_folder(),
             Action::ForgetLocalFilesFolder => self.set_local_files_folder(None),
             Action::OpenLocalFilesFolder => {

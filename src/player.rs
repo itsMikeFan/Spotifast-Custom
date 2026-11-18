@@ -553,7 +553,12 @@ impl Engine {
             normalisation_report: Some(Arc::clone(&normalisation_factor)),
             // librespot reads this folder's tags on its own player thread
             // when the engine starts, never on the UI thread.
-            local_file_directories: config.local_files.iter().cloned().collect(),
+            local_file_directories: config
+                .local_files
+                .iter()
+                .cloned()
+                .chain(std::iter::once(crate::local_songs::dir()))
+                .collect(),
             ..PlayerConfig::default()
         };
 

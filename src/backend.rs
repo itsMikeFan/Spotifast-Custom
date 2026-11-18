@@ -52,10 +52,14 @@ const RADIO_TIMEOUT: Duration = Duration::from_secs(20);
 fn local_file_uris(
     folder: &std::path::Path,
 ) -> std::collections::HashMap<String, std::path::PathBuf> {
-    librespot_playback::local_file::create_local_file_lookup(&[folder.to_path_buf()])
-        .iter()
-        .map(|(uri, path)| (uri.to_uri(), path.to_path_buf()))
-        .collect()
+    // Songs added from this PC play from the localsongs folder, too.
+    librespot_playback::local_file::create_local_file_lookup(&[
+        folder.to_path_buf(),
+        crate::local_songs::dir(),
+    ])
+    .iter()
+    .map(|(uri, path)| (uri.to_uri(), path.to_path_buf()))
+    .collect()
 }
 /// Newest episodes read from each saved podcast for Home's podcast shelf.
 const HOME_EPISODES_PER_SHOW: u32 = 5;
@@ -763,6 +767,14 @@ pub enum Command {
     /// Find the songs in the local files folder, off the UI thread, as the
     /// player does when it starts.
     ScanLocalFiles(std::path::PathBuf),
+    /// Copy the picked files into the localsongs folder for `playlist`.
+    ImportLocalSongs {
+        playlist: String,
+        replaces: Option<String>,
+        selected: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Vec<rfd::FileHandle>>> + Send>,
+        >,
+    },
     /// Start (or restart) the Web API sign-in in the browser.
     SignIn {
         request: u64,
@@ -992,6 +1004,13 @@ pub struct LyricsRequest {
 }
 
 pub enum Event {
+    /// Files copied into the localsongs folder for `playlist`, each as the
+    /// `spotify:local:` URI it plays by, or why it could not be.
+    LocalSongsImported {
+        playlist: String,
+        replaces: Option<String>,
+        results: Vec<Result<String, String>>,
+    },
     /// The folder picked in the local files dialog; `None` when cancelled.
     LocalFilesFolderChosen(Option<std::path::PathBuf>),
     /// The songs in `folder`, by the `spotify:local:` URIs they play for.
@@ -1388,6 +1407,29 @@ impl Backend {
             id,
             request,
             selected: Box::pin(selected),
+        });
+    }
+
+    /// Pick songs from this PC for `playlist`, or one to stand in for the
+    /// unavailable song `replaces`.
+    pub fn choose_local_songs(&self, playlist: String, replaces: Option<String>) {
+        if self.offline {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title("Add songs from this PC")
+            .add_filter("Audio", &["mp3", "flac"]);
+        let selected: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Option<Vec<rfd::FileHandle>>> + Send>,
+        > = if replaces.is_some() {
+            Box::pin(async move { dialog.pick_file().await.map(|file| vec![file]) })
+        } else {
+            Box::pin(dialog.pick_files())
+        };
+        self.send(Command::ImportLocalSongs {
+            playlist,
+            replaces,
+            selected,
         });
     }
 
@@ -2270,6 +2312,38 @@ impl Worker {
                     tokio::spawn(async move {
                         let folder = selected.await.map(|folder| folder.path().to_path_buf());
                         let _ = events.send(Event::LocalFilesFolderChosen(folder));
+                        waker.wake();
+                    });
+                }
+                Command::ImportLocalSongs {
+                    playlist,
+                    replaces,
+                    selected,
+                } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        let Some(files) = selected.await else {
+                            return;
+                        };
+                        let paths: Vec<_> =
+                            files.iter().map(|file| file.path().to_path_buf()).collect();
+                        let Ok(results) = tokio::task::spawn_blocking(move || {
+                            let folder = crate::local_songs::dir();
+                            paths
+                                .iter()
+                                .map(|path| crate::local_songs::import(path, &folder))
+                                .collect()
+                        })
+                        .await
+                        else {
+                            return;
+                        };
+                        let _ = events.send(Event::LocalSongsImported {
+                            playlist,
+                            replaces,
+                            results,
+                        });
                         waker.wake();
                     });
                 }

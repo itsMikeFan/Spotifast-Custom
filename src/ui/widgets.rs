@@ -1130,6 +1130,40 @@ fn item_menu_at(
             });
         }
     }
+    let in_playlist = match context {
+        Some(RowContext::Context { uri, .. }) => Some(uri),
+        Some(RowContext::View { context_uri, .. }) => Some(context_uri),
+        _ => None,
+    }
+    .filter(|playlist| playlist.starts_with("spotify:playlist:"))
+    .cloned();
+    if let Some(playlist) = in_playlist {
+        if app.local_songs.contains(&playlist, &uri) {
+            if menu_item(
+                ui,
+                &palette,
+                Some(Icon::Minus),
+                &gettext(locale, "Remove song from this PC"),
+            ) {
+                app.actions.push(Action::RemoveLocalSong {
+                    playlist,
+                    uri: uri.clone(),
+                });
+            }
+        } else if crate::ui::collection::is_unavailable(item)
+            && menu_item(
+                ui,
+                &palette,
+                Some(Icon::ListPlus),
+                &gettext(locale, "Replace with a song from this PC…"),
+            )
+        {
+            app.actions.push(Action::ChooseLocalSongs {
+                playlist,
+                replaces: Some(uri.clone()),
+            });
+        }
+    }
     menu_separator(ui, &palette);
     match item {
         PlayableItem::Track(track) => {
@@ -1247,6 +1281,19 @@ pub fn context_menu_items(
         )
     {
         app.actions.push(Action::ShufflePlay(uri.to_string()));
+    }
+    if kind == "playlist"
+        && menu_item(
+            ui,
+            &palette,
+            Some(Icon::ListPlus),
+            &gettext(locale, "Add songs from this PC…"),
+        )
+    {
+        app.actions.push(Action::ChooseLocalSongs {
+            playlist: uri.to_string(),
+            replaces: None,
+        });
     }
     if kind == "album"
         && menu_item(
@@ -1757,6 +1804,9 @@ fn track_row_contents(
                 if track.explicit {
                     explicit_badge(&mut child, &palette);
                 }
+                if track.is_local || track.uri.starts_with("spotify:local:") {
+                    local_badge(&mut child, &palette);
+                }
                 theme::text(
                     &mut child,
                     "•",
@@ -1850,6 +1900,9 @@ fn track_row_contents(
                 PlayableItem::Track(track) => {
                     if track.explicit {
                         explicit_badge(ui, &palette);
+                    }
+                    if track.is_local || track.uri.starts_with("spotify:local:") {
+                        local_badge(ui, &palette);
                     }
                     artist_links(
                         ui,
@@ -2299,6 +2352,21 @@ pub fn explicit_badge(ui: &mut Ui, palette: &Palette) {
         theme::bold(9.5),
         palette.window,
     );
+}
+
+/// Marks a song that plays from a file on this PC.
+pub fn local_badge(ui: &mut Ui, palette: &Palette) {
+    let (rect, response) = ui.allocate_exact_size(vec2(38.0, 15.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, CornerRadius::same(2), palette.accent);
+    ui.painter().text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "LOCAL",
+        theme::bold(9.0),
+        palette.on_accent,
+    );
+    response.on_hover_text("Plays from a file on this PC");
 }
 
 /// The header row above a track table.

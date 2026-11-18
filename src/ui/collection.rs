@@ -1070,11 +1070,7 @@ fn table_contents(app: &mut App, ui: &mut egui::Ui, table: Table<'_>) {
             &gettext(locale, "Nothing here yet"),
             &gettext(locale, "Added songs appear here."),
         );
-    } else if entry.visible.is_empty()
-        && !unfiltered
-        && table.can_load_more
-        && !table.loading
-    {
+    } else if entry.visible.is_empty() && !unfiltered && table.can_load_more && !table.loading {
         // Filtering a partially loaded list: keep fetching so matches appear.
         app.actions.push(Action::LoadMore(table.page));
     } else if finite.is_none() {
@@ -1518,6 +1514,87 @@ fn hidden_rows(
     rows
 }
 
+/// Puts the playlist's songs from this PC among its rows: each stand-in at
+/// its unavailable song's place, the rest after the last Spotify song once
+/// every page is in, at slots `server_rows` onwards. Answers the rows,
+/// their positions, and how many rows were added.
+fn with_local_songs(
+    ui: &egui::Ui,
+    app: &App,
+    playlist_uri: &str,
+    items: Arc<Vec<TableItem>>,
+    positions: Arc<Vec<usize>>,
+    server_rows: usize,
+    complete: bool,
+) -> (Arc<Vec<TableItem>>, Arc<Vec<usize>>, usize) {
+    type Placed = (
+        usize,
+        usize,
+        u64,
+        bool,
+        Arc<Vec<TableItem>>,
+        Arc<Vec<usize>>,
+        usize,
+    );
+    let songs: Vec<&crate::local_songs::LocalSong> =
+        app.local_songs.in_playlist(playlist_uri).collect();
+    if songs.is_empty() {
+        return (items, positions, 0);
+    }
+    let key = egui::Id::new("local-song-rows").with(playlist_uri);
+    let source = (
+        Arc::as_ptr(&items) as usize,
+        Arc::as_ptr(&positions) as usize,
+    );
+    if let Some((rows_at, positions_at, revision, was_complete, rows, placed, extra)) =
+        ui.data(|d| d.get_temp::<Placed>(key))
+        && (rows_at, positions_at) == source
+        && revision == app.local_songs_revision
+        && was_complete == complete
+    {
+        return (rows, placed, extra);
+    }
+    let mut rows = (*items).clone();
+    for row in &mut rows {
+        if let PlayableItem::Track(track) = &row.0
+            && let Some(song) = songs
+                .iter()
+                .find(|song| song.replaces.as_deref() == Some(track.uri.as_str()))
+        {
+            row.0 = PlayableItem::Track(crate::local_songs::track(&song.uri));
+        }
+    }
+    let mut placed = (*positions).clone();
+    let mut extra = 0;
+    if complete {
+        for song in songs.iter().filter(|song| song.replaces.is_none()) {
+            rows.push((
+                PlayableItem::Track(crate::local_songs::track(&song.uri)),
+                None,
+                None,
+            ));
+            placed.push(server_rows + extra);
+            extra += 1;
+        }
+    }
+    let (rows, placed) = (Arc::new(rows), Arc::new(placed));
+    ui.data_mut(|d| {
+        d.insert_temp::<Placed>(
+            key,
+            (
+                source.0,
+                source.1,
+                app.local_songs_revision,
+                complete,
+                Arc::clone(&rows),
+                Arc::clone(&placed),
+                extra,
+            ),
+        );
+    });
+    (rows, placed, extra)
+}
+
 /// A song Spotify keeps in the playlist but this account cannot play:
 /// taken down, or not released in the account's country.
 pub(crate) fn is_unavailable(item: &PlayableItem) -> bool {
@@ -1551,7 +1628,10 @@ fn unavailable_toggle(
             *unavailable_only = !*unavailable_only;
         }
         if *unavailable_only {
-            let count = items.iter().filter(|(item, _, _)| is_unavailable(item)).count();
+            let count = items
+                .iter()
+                .filter(|(item, _, _)| is_unavailable(item))
+                .count();
             let mut text = match count {
                 1 => "1 unavailable song".to_string(),
                 n => format!("{n} unavailable songs"),
@@ -1765,15 +1845,34 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             // unavailable songs, or the hidden ones would pass for them.
             let hides = !page.unavailable_only
                 && app
-                .hidden_songs
-                .get(&playlist.uri)
-                .is_some_and(|songs| !songs.is_empty());
+                    .hidden_songs
+                    .get(&playlist.uri)
+                    .is_some_and(|songs| !songs.is_empty());
             let items = if hides {
                 hidden_rows(ui, app, id, &playlist.uri, &items)
             } else {
                 items
             };
-            let items_revision = page.items.revision.wrapping_add(app.hidden_songs_revision);
+            let raw_rows = page.items.items.len();
+            let server_rows = (page.items.total.unwrap_or(0) as usize).max(raw_rows);
+            let complete = page.items.is_complete();
+            let (items, positions, local_extra) = with_local_songs(
+                ui,
+                app,
+                &playlist.uri,
+                items,
+                positions,
+                server_rows,
+                complete,
+            );
+            // Songs from this PC are not in Spotify's copy of the playlist,
+            // so playback follows the rows on screen, as it does for hidden songs.
+            let plays_shown = hides || app.local_songs.in_playlist(&playlist.uri).next().is_some();
+            let items_revision = page
+                .items
+                .revision
+                .wrapping_add(app.hidden_songs_revision)
+                .wrapping_add(app.local_songs_revision << 32);
             if items.is_empty() && !app.network_reachable {
                 widgets::empty_state(
                     ui,
@@ -1842,7 +1941,7 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 ViewOptions {
                     needle: &needle,
                     sort,
-                    plays_shown_rows: hides,
+                    plays_shown_rows: plays_shown,
                     unavailable_only: page.unavailable_only,
                 },
                 items_revision,
@@ -1855,7 +1954,7 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             };
             let mut actions =
                 playlist_actions(app.locale, playlist, owned, saved, view_play, reload_action);
-            actions.plays_shown_rows = hides;
+            actions.plays_shown_rows = plays_shown;
             if !app.network_reachable {
                 disabled_actions_row(app, ui, actions, Some(&mut page.filter));
             } else {
@@ -1876,8 +1975,16 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     items: &items,
                     row_offset: page.items.base_offset,
                     pagination: Some(TablePagination {
-                        total: page.items.total.unwrap_or(count),
-                        loaded_count: page.items.items.len(),
+                        total: if local_extra > 0 {
+                            (server_rows + local_extra) as u32
+                        } else {
+                            page.items.total.unwrap_or(count)
+                        },
+                        loaded_count: if local_extra > 0 {
+                            server_rows + local_extra
+                        } else {
+                            raw_rows
+                        },
                         positions: Some(&positions),
                     }),
                     context: RowContext::Context {
@@ -1901,7 +2008,7 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     can_load_more: page.items.can_load_more(),
                     filter: &page.filter,
                     items_revision,
-                    plays_shown_rows: hides,
+                    plays_shown_rows: plays_shown,
                     unavailable_only: page.unavailable_only,
                 },
             );
@@ -2996,6 +3103,7 @@ mod tests {
                 items: PagedList {
                     items: entries,
                     total: Some(3),
+                    next_offset: None,
                     loaded_once: true,
                     ..Default::default()
                 },
@@ -3031,6 +3139,37 @@ mod tests {
         };
         assert!(shows(1), "the unavailable song is listed");
         assert!(!shows(0) && !shows(2), "playable songs are left out");
+
+        // A song from this PC stands in for it, another follows the list.
+        let gone = app.playlist_pages["gaps"].items.items[1]
+            .playable()
+            .unwrap()
+            .uri()
+            .to_string();
+        for (uri, replaces) in [
+            ("spotify:local:Me::Stand+In:100", Some(gone)),
+            ("spotify:local:Me::Extra+Song:120", None),
+        ] {
+            app.local_songs.add(crate::local_songs::LocalSong {
+                playlist: "spotify:playlist:gaps".into(),
+                uri: uri.into(),
+                replaces,
+            });
+        }
+        app.local_songs_revision += 1;
+        app.playlist_pages.get_mut("gaps").unwrap().unavailable_only = false;
+        frame(&mut app);
+        let tree = frame(&mut app);
+        let labels: Vec<String> = tree
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_string))
+            .collect();
+        let shows = |text: &str| labels.iter().any(|label| label.contains(text));
+        assert!(shows("Stand In"), "the stand-in takes the unavailable row");
+        assert!(!shows("song 1 with"), "the unavailable song gives way");
+        assert!(shows("Extra Song"), "an added song follows the list");
+        assert!(shows("song 0 with") && shows("song 2 with"));
     }
 
     #[test]

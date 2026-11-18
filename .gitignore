@@ -30,3 +30,6 @@ docs/.bundle/
 /.cache/
 
 /dist/
+
+# Songs from this PC and their playlist list (personal audio)
+/localsongs/
