@@ -9,7 +9,7 @@ use crate::model::{Action, DiscographyFilter, Loadable, Page, RowContext};
 use crate::theme::{self, Icon};
 use crate::util;
 
-use super::collection::{Hero, hero, hero_images};
+use super::collection::{Hero, HeroArt, hero, hero_images};
 use super::widgets::{self, TrackRow};
 
 pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
@@ -42,6 +42,8 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     let items: Vec<PlayableItem> =
                         tracks.iter().cloned().map(PlayableItem::Track).collect();
                     let limit = if page.show_all_top { items.len() } else { 5 };
+                    app.request_play_counts(&artist.uri);
+                    let show_plays = app.has_play_counts(&artist.uri);
                     let render_top = |ui: &mut egui::Ui, app: &mut App| {
                         for (index, item) in items.iter().take(limit).enumerate() {
                             widgets::track_row(
@@ -57,11 +59,14 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                                     added_at: None,
                                     added_by: None,
                                     show_added_by: false,
+                                    show_plays,
                                     compact: false,
                                     thin: app.settings.tracklist_compact,
                                     shift: 0.0,
                                     picked: false,
                                     picked_songs: &[],
+                                    picked_positions: &[],
+                                    position: None,
                                 },
                             );
                         }
@@ -97,7 +102,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                     theme::subtle(ui, &palette, &gettext(locale, "No popular songs to show."));
                 }
                 Loadable::Loading | Loadable::NotLoaded => {
-                    widgets::loading_row(ui, &palette, app.locale)
+                    widgets::skeleton_rows(ui, &palette, app.locale, 5)
                 }
                 Loadable::Failed(error) => {
                     let error = error.clone();
@@ -142,10 +147,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                             let context_here =
                                 app.playing_context_uri().as_deref() == Some(album.uri.as_str());
                             let playing_here = context_here && app.believed_playing();
+                            let card_art = app.art_px(widgets::CARD_ART);
                             let card = widgets::card(
                                 ui,
                                 app,
-                                pick_image(&album.images, 640),
+                                pick_image(&album.images, card_art),
                                 &album.name,
                                 subtitle.trim_start_matches(" • "),
                                 widgets::CardCover::square(playing_here),
@@ -202,7 +208,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         }
                     }
                 }
-                None => widgets::loading_row(ui, &palette, app.locale),
+                None => widgets::grid(ui, |ui| {
+                    widgets::skeleton_cards(ui, &palette, app.locale, 6, false)
+                }),
             }
             ui.add_space(20.0);
 
@@ -217,10 +225,11 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                         let context_here =
                             app.playing_context_uri().as_deref() == Some(artist.uri.as_str());
                         let playing_here = context_here && app.believed_playing();
+                        let card_art = app.art_px(widgets::CARD_ART);
                         let card = widgets::card(
                             ui,
                             app,
-                            pick_image(&artist.images, 640),
+                            pick_image(&artist.images, card_art),
                             &artist.name,
                             &artist_label,
                             widgets::CardCover::portrait(playing_here),
@@ -277,7 +286,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui, id: &str) {
                 if let Some(artist) = &preview {
                     ui.add_enabled_ui(false, |ui| artist_actions(app, ui, artist));
                 }
-                widgets::loading_row(ui, &palette, app.locale);
+                widgets::skeleton_rows(ui, &palette, app.locale, 5);
             }
         }
         Loadable::Failed(error) => {
@@ -344,6 +353,7 @@ fn artist_hero(app: &mut App, ui: &mut egui::Ui, artist: &Artist, preview: Optio
         &artist.images,
         preview.map(|artist| artist.images.as_slice()),
         false,
+        HeroArt::of(app),
     );
     hero(
         app,
@@ -355,6 +365,8 @@ fn artist_hero(app: &mut App, ui: &mut egui::Ui, artist: &Artist, preview: Optio
             title: &artist.name,
             description: None,
             byline,
+            byline_tooltip: None,
+            avatar: None,
             round: true,
         },
     );

@@ -11,6 +11,10 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     let Some(dialog) = app.dialog.clone() else {
         return;
     };
+    if let Dialog::CoverArt { url, shown, title } = &dialog {
+        cover_art(app, ctx, url, shown.as_deref(), title);
+        return;
+    }
     let palette = app.palette;
     let locale = app.locale;
     let frame = Frame::new()
@@ -34,30 +38,25 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         .show(ctx, |ui| {
             ui.set_width(420.0);
             match dialog {
+                // Drawn by cover_art above.
+                Dialog::CoverArt { .. } => {}
                 Dialog::PersonalAppIntro => {
-                    theme::text(ui, gettext(locale, "Spend less time waiting for Spotify"), theme::bold(20.0), palette.text);
+                    theme::text(ui, gettext(locale, "Move to your own Spotify app"), theme::bold(20.0), palette.text);
                     ui.add_space(12.0);
-                    for text in [
-                        gettext(locale, "Spotifast's default connection shares Spotify's request limit with other listeners. When it gets busy, loading music and using playback controls can take longer."),
-                        gettext(locale, "Your Premium account lets you create a free personal Spotify app. Connect it here to give supported requests your own allowance. Some pages still use the shared connection."),
-                        gettext(locale, "Setup takes a few minutes. You can also find it later in Settings under Personal Spotify app."),
-                    ] {
-                        ui.add(egui::Label::new(egui::RichText::new(text).font(theme::regular(14.0)).color(palette.secondary)).wrap());
-                        ui.add_space(10.0);
-                    }
+                    ui.add(egui::Label::new(egui::RichText::new(gettext(locale, "You're signed in through the shared app Spotifast used before. Spotifast no longer offers it, and Spotify can stop accepting it at any time. Set up your own free Spotify app so nothing stops your music. It takes a few minutes.")).font(theme::regular(14.0)).color(palette.secondary)).wrap());
+                    ui.add_space(10.0);
                     ui.add_space(8.0);
                     buttons(ui, |ui| {
                         if theme::pill_button(ui, &palette, &gettext(locale, "Set up personal app"), true).clicked() {
                             app.actions.push(Action::OpenPersonalAppSetup);
                         }
-                        if theme::pill_button(ui, &palette, &gettext(locale, "Keep shared app"), false).clicked() {
+                        if theme::pill_button(ui, &palette, &gettext(locale, "Not now"), false).clicked() {
                             app.actions.push(Action::CloseDialog);
                         }
                     });
                 }
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
-                Dialog::PlaylistDuplicates { .. } => playlist_duplicates(app, ui),
                 Dialog::ConfirmDeletePlaylist { id, name, owned } => {
                     theme::text(
                         ui,
@@ -343,132 +342,6 @@ fn text_field(
     response
 }
 
-fn playlist_duplicates(app: &mut App, ui: &mut egui::Ui) {
-    let palette = app.palette;
-    let locale = app.locale;
-    let Some(Dialog::PlaylistDuplicates {
-        playlist_id,
-        playlist_name,
-        rows,
-        groups,
-        remove,
-    }) = &mut app.dialog
-    else {
-        return;
-    };
-    theme::text(
-        ui,
-        gettext(locale, "Duplicate songs"),
-        theme::bold(20.0),
-        palette.text,
-    );
-    ui.add_space(8.0);
-    ui.add(
-        egui::Label::new(
-            egui::RichText::new(
-                // Translators: {playlist} is a playlist name.
-                gettext(
-                    locale,
-                    "Same song name and artist in “{playlist}”. Ticked rows will be removed.",
-                )
-                .replace("{playlist}", playlist_name),
-            )
-            .font(theme::regular(14.0))
-            .color(palette.secondary),
-        )
-        .wrap(),
-    );
-    ui.add_space(12.0);
-    let room = ui.ctx().content_rect().height() - 220.0;
-    egui::ScrollArea::vertical()
-        .max_height(room.max(120.0))
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            for group in groups.iter() {
-                let Some(first) = rows[group[0]].as_ref() else {
-                    continue;
-                };
-                theme::text(
-                    ui,
-                    format!("{} · {}", first.name(), first.subtitle()),
-                    theme::semibold(14.0),
-                    palette.text,
-                );
-                for &index in group {
-                    let Some(item) = rows[index].as_ref() else {
-                        continue;
-                    };
-                    let album = match item {
-                        crate::api::models::PlayableItem::Track(track) => track
-                            .album
-                            .as_ref()
-                            .map(|album| album.name.clone())
-                            .unwrap_or_default(),
-                        crate::api::models::PlayableItem::Episode(_) => String::new(),
-                    };
-                    let mut ticked = remove.contains(&index);
-                    let label = format!(
-                        "#{}  {}  {}",
-                        index + 1,
-                        album,
-                        crate::util::format_duration_ms(item.duration_ms())
-                    );
-                    if ui
-                        .checkbox(
-                            &mut ticked,
-                            egui::RichText::new(label)
-                                .font(theme::regular(13.0))
-                                .color(palette.secondary),
-                        )
-                        .changed()
-                    {
-                        if ticked {
-                            remove.insert(index);
-                        } else {
-                            remove.remove(&index);
-                        }
-                    }
-                }
-                ui.add_space(10.0);
-            }
-        });
-    ui.add_space(16.0);
-    let count = remove.len();
-    let mut confirmed = false;
-    buttons(ui, |ui| {
-        let label = ngettext(
-            locale,
-            "Remove {count} song",
-            "Remove {count} songs",
-            count as u32,
-        )
-        .replace("{count}", &count.to_string());
-        confirmed = ui
-            .add_enabled_ui(count > 0, |ui| {
-                theme::pill_button(ui, &palette, &label, true)
-            })
-            .inner
-            .clicked();
-        if theme::pill_button(ui, &palette, &gettext(locale, "Cancel"), false).clicked() {
-            app.actions.push(Action::CloseDialog);
-        }
-    });
-    if confirmed {
-        app.actions.push(Action::RemovePlaylistDuplicates {
-            playlist_id: playlist_id.clone(),
-            rows: rows
-                .iter()
-                .map(|row| {
-                    row.as_ref()
-                        .map(|item| item.uri().to_string())
-                        .unwrap_or_default()
-                })
-                .collect(),
-            remove: remove.clone(),
-        });
-    }
-}
-
 fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
     let palette = app.palette;
     let locale = app.locale;
@@ -596,12 +469,14 @@ fn edit_playlist(app: &mut App, ui: &mut egui::Ui) {
                         .include_bytes(selected.uri.clone(), selected.jpeg.clone());
                     ui.add(
                         egui::Image::new(selected.uri.clone())
+                            .texture_options(crate::images::COVER_TEXTURE)
                             .fit_to_exact_size(egui::vec2(72.0, 72.0))
                             .alt_text(gettext(locale, "Selected playlist cover")),
                     );
                 } else if let Some(url) = &existing_image {
                     ui.add(
                         egui::Image::new(url)
+                            .texture_options(crate::images::COVER_TEXTURE)
                             .fit_to_exact_size(egui::vec2(72.0, 72.0))
                             .alt_text(gettext(locale, "Current playlist cover")),
                     );
@@ -782,5 +657,65 @@ mod tests {
             message,
             "“Honey” is already in “The best music ever”. Add them anyway?"
         );
+    }
+}
+
+/// A page's header cover, as large as the window allows, over the dimmed
+/// page. A click anywhere, on the cover or around it, or Esc closes it.
+fn cover_art(app: &mut App, ctx: &egui::Context, url: &str, shown: Option<&str>, title: &str) {
+    let palette = app.palette;
+    let side = cover_art_side(ctx.content_rect().size());
+    let response = egui::Modal::new(egui::Id::new("cover-art"))
+        .frame(Frame::new().shadow(egui::epaint::Shadow {
+            offset: [0, 10],
+            blur: 40,
+            spread: 0,
+            color: palette.shadow,
+        }))
+        .backdrop_color(egui::Color32::from_black_alpha(if palette.dark {
+            190
+        } else {
+            150
+        }))
+        .show(ctx, |ui| {
+            let (rect, cover) =
+                ui.allocate_exact_size(egui::Vec2::splat(side), egui::Sense::click());
+            cover.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Image, true, title));
+            super::widgets::paint_cover_with_thumbnail(
+                ui,
+                &palette,
+                super::widgets::CoverSources {
+                    requested: Some(url),
+                    previous: shown,
+                    ..Default::default()
+                },
+                rect,
+                8.0,
+                theme::Icon::Music,
+                Some(app.backend.art()),
+            );
+            cover.clicked()
+        });
+    app.dialog_rect = Some(response.response.rect);
+    if response.inner || response.should_close() {
+        app.actions.push(Action::CloseDialog);
+    }
+}
+
+/// The enlarged cover's side: as much of the window as leaves a margin
+/// around it, and no larger than Spotify's largest artwork, 640 pixels wide.
+fn cover_art_side(window: egui::Vec2) -> f32 {
+    (window.x.min(window.y) - 96.0).clamp(120.0, 640.0)
+}
+
+#[cfg(test)]
+mod cover_art_tests {
+    use super::cover_art_side;
+
+    #[test]
+    fn the_enlarged_cover_fits_the_window_up_to_spotifys_largest_artwork() {
+        assert_eq!(cover_art_side(egui::vec2(1240.0, 800.0)), 640.0);
+        assert_eq!(cover_art_side(egui::vec2(760.0, 620.0)), 524.0);
+        assert_eq!(cover_art_side(egui::vec2(100.0, 100.0)), 120.0);
     }
 }

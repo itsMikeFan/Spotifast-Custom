@@ -110,6 +110,8 @@ fn episode_retained_bytes(episode: &Episode) -> usize {
 pub enum Page {
     Home,
     TopSongs,
+    /// The songs of the latest releases from followed artists.
+    NewReleases,
     Search,
     LikedSongs,
     Albums,
@@ -132,6 +134,7 @@ impl Page {
         match self {
             Page::Home => "home".into(),
             Page::TopSongs => "top-songs".into(),
+            Page::NewReleases => "new-releases".into(),
             Page::Search => "search".into(),
             Page::LikedSongs => "liked".into(),
             Page::Albums => "albums".into(),
@@ -152,6 +155,7 @@ impl Page {
         Some(match text {
             "home" => Page::Home,
             "top-songs" => Page::TopSongs,
+            "new-releases" => Page::NewReleases,
             "search" => Page::Search,
             "liked" => Page::LikedSongs,
             "albums" => Page::Albums,
@@ -603,19 +607,114 @@ pub struct PlaylistEdit {
     pub settled_by: Option<u64>,
 }
 
+/// Time range for top tracks affinity rankings.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TopPeriod {
+    #[default]
+    ShortTerm,
+    MediumTerm,
+    LongTerm,
+}
+
+impl TopPeriod {
+    pub const ALL: [TopPeriod; 3] = [Self::ShortTerm, Self::MediumTerm, Self::LongTerm];
+
+    pub fn as_spotify(self) -> &'static str {
+        match self {
+            Self::ShortTerm => "short_term",
+            Self::MediumTerm => "medium_term",
+            Self::LongTerm => "long_term",
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::ShortTerm => 0,
+            Self::MediumTerm => 1,
+            Self::LongTerm => 2,
+        }
+    }
+
+    pub fn from_index(index: usize) -> Self {
+        match index {
+            1 => Self::MediumTerm,
+            2 => Self::LongTerm,
+            _ => Self::ShortTerm,
+        }
+    }
+
+    pub fn label(self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        use crate::i18n::gettext;
+        match self {
+            Self::ShortTerm => gettext(locale, "Last 4 weeks"),
+            Self::MediumTerm => gettext(locale, "Last 6 months"),
+            Self::LongTerm => gettext(locale, "Past year"),
+        }
+    }
+
+    pub fn subtitle(self, locale: crate::i18n::Locale) -> std::borrow::Cow<'static, str> {
+        use crate::i18n::gettext;
+        match self {
+            Self::ShortTerm => gettext(
+                locale,
+                "Calculated from your listening over approximately the last 4 weeks.",
+            ),
+            Self::MediumTerm => gettext(
+                locale,
+                "Calculated from your listening over approximately the last 6 months.",
+            ),
+            Self::LongTerm => gettext(
+                locale,
+                "Calculated from several years of listening history.",
+            ),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct HomeData {
     pub recently_played: Loadable<Vec<PlayHistory>>,
     pub top_artists: Loadable<Vec<Artist>>,
-    /// The 20-track preview shown on Home.
+    /// Active period selected for top songs.
+    pub top_period: TopPeriod,
+    /// Whether the user has chosen a period during this session, preventing
+    /// late cache restoration from overriding their selection.
+    pub top_period_selected: bool,
+    /// The 20-track preview shown on Home for the active period.
     pub top_tracks: Loadable<Vec<Track>>,
-    /// The separately loaded, complete ranking shown by the Top Songs page.
+    /// Cached 20-track previews for each period.
+    pub top_tracks_by_period: [Loadable<Vec<Track>>; 3],
+    /// Generations for each period's Home top tracks requests.
+    pub top_tracks_generations: [u64; 3],
+    /// The separately loaded, complete ranking shown by the Top Songs page for the active period.
     pub top_songs: Loadable<Vec<Track>>,
+    /// Cached complete rankings for each period.
+    pub top_songs_by_period: [Loadable<Vec<Track>>; 3],
     pub top_songs_loading: bool,
     pub top_songs_complete: bool,
+    pub top_songs_by_period_loading: [bool; 3],
+    pub top_songs_by_period_complete: [bool; 3],
     pub recommendations: Loadable<Vec<Track>>,
-    pub discover: HashMap<String, Loadable<Vec<Playlist>>>,
-    pub discover_pending: HashMap<String, Loadable<Vec<Playlist>>>,
+    pub made_for_you: Loadable<Vec<Playlist>>,
+    /// Whether the displayed cards came from the personalized session route.
+    pub made_for_you_personalized: bool,
+    /// Independent request serial: playback readiness can supersede a fallback.
+    pub made_for_you_generation: u64,
+    /// One outstanding shelf answer counts toward the Home refresh.
+    pub made_for_you_loading: bool,
+    /// Whether playback was ready when the current shelf request began.
+    pub made_for_you_session_requested: bool,
+    pub top_mixes: Loadable<Vec<Playlist>>,
+    /// The latest releases from followed artists, newest first.
+    pub new_releases: Loadable<Vec<Album>>,
+    pub new_releases_generation: u64,
+    /// One outstanding New releases answer counts toward the Home refresh.
+    pub new_releases_loading: bool,
+    /// The songs of `new_releases`, for the New releases page, and the
+    /// releases they were read for.
+    pub new_release_tracks: Loadable<Vec<Track>>,
+    pub new_release_tracks_for: Vec<String>,
+    pub new_release_tracks_generation: u64,
     /// Saved podcasts with their newest episodes, in library order, for the
     /// podcast shelf. A refresh replaces them only once it answers.
     pub podcasts: Vec<(Show, Vec<Episode>)>,
@@ -623,6 +722,7 @@ pub struct HomeData {
     pub podcasts_generation: u64,
     pub generation: u64,
     pub top_songs_generation: u64,
+    pub top_songs_generations: [u64; 3],
     pub requested: bool,
     pub loaded_at: Option<Instant>,
     /// Answers the current refresh still waits for.
@@ -655,13 +755,24 @@ pub struct HomeSnapshot {
     /// at the next start instead of showing as empty.
     pub recently_played: Option<Vec<PlayHistory>>,
     pub top_artists: Option<Vec<Artist>>,
+    /// Last 4 weeks top tracks preview (retained for backward compatibility).
     pub top_tracks: Option<Vec<Track>>,
-    /// Made for you, by search term, for the searches that answered.
+    /// Last 6 months top tracks preview.
+    pub top_tracks_medium: Option<Vec<Track>>,
+    /// Past year top tracks preview.
+    pub top_tracks_long: Option<Vec<Track>>,
+    /// Active period selected for top songs.
+    pub top_period: TopPeriod,
+    /// The ordered shelf and its origin, retained across restarts.
+    pub made_for_you: Option<Vec<Playlist>>,
+    pub made_for_you_personalized: bool,
+    pub top_mixes: Option<Vec<Playlist>>,
+    pub new_releases: Option<Vec<Album>>,
+    /// Legacy search shelves, read for compatibility with older cache files.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub discover: std::collections::BTreeMap<String, Vec<Playlist>>,
     pub podcasts: Vec<(Show, Vec<Episode>)>,
 }
-
-pub const DISCOVER_TERMS: &[&str] = &["Discover Weekly", "Release Radar", "Daily Mix", "daylist"];
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SearchFilter {
@@ -796,6 +907,7 @@ pub struct PlaylistCachePending {
 pub struct AlbumPage {
     pub generation: u64,
     pub album: Loadable<Album>,
+    pub prerelease: Option<crate::prerelease::Prerelease>,
     pub tracks: PagedList<Track>,
 }
 
@@ -940,6 +1052,14 @@ pub struct DragEntry {
 
 #[derive(Clone, Debug)]
 pub enum Dialog {
+    /// A page's header cover, enlarged. Clicking anywhere or Esc closes it.
+    CoverArt {
+        /// The largest artwork Spotify has.
+        url: String,
+        /// The header's own artwork, already loaded, shown until `url` is.
+        shown: Option<String>,
+        title: String,
+    },
     CreatePlaylist {
         name: String,
         public: bool,
@@ -965,17 +1085,6 @@ pub enum Dialog {
         items: Vec<PlayableItem>,
         position: Option<u32>,
         duplicate_uris: Vec<String>,
-    },
-    /// Duplicate songs found in a playlist, for picking which rows to remove.
-    PlaylistDuplicates {
-        playlist_id: String,
-        playlist_name: String,
-        /// Every playlist row in order, as read when the dialog opened.
-        rows: Vec<Option<PlayableItem>>,
-        /// Row indices sharing a song, each group in playlist order.
-        groups: Vec<Vec<usize>>,
-        /// Row indices ticked for removal.
-        remove: std::collections::BTreeSet<usize>,
     },
     Shortcuts,
     /// The signed-in account is not Premium, so nothing will play.
@@ -1073,6 +1182,10 @@ pub enum Action {
     QueueMany {
         songs: Vec<(String, String)>,
     },
+    /// Put songs first in the manual queue, in order, only on this computer.
+    PlayNext {
+        items: Vec<PlayableItem>,
+    },
     /// Move a row within the manually queued "Playing next" section, from a
     /// drag dropped back on the queue. Only applied while the local player
     /// is the active target; see [`crate::app::App::queue_locally_reorderable`].
@@ -1086,6 +1199,13 @@ pub enum Action {
     InsertInQueue {
         items: Vec<PlayableItem>,
         position: usize,
+    },
+    /// Take rows out of the manually queued "Playing next" section, each
+    /// named by its index in the queue and the song it holds there. Only
+    /// applied while the local player is the active target; see
+    /// [`crate::app::App::queue_locally_reorderable`].
+    RemoveFromQueue {
+        rows: Vec<(usize, String)>,
     },
     /// Set saved state for several songs explicitly.
     SetSavedMany {
@@ -1112,16 +1232,10 @@ pub enum Action {
     RemoveFromPlaylist {
         playlist_id: String,
         uris: Vec<String>,
-    },
-    FindPlaylistDuplicates {
-        playlist_id: String,
-        playlist_name: String,
-    },
-    /// Remove the rows at `remove` from a playlist whose rows were `rows`.
-    RemovePlaylistDuplicates {
-        playlist_id: String,
-        rows: Vec<String>,
-        remove: std::collections::BTreeSet<usize>,
+        /// The picked rows' server positions, one for each of `uris`, when
+        /// the view knows them; empty otherwise. With them, a song the list
+        /// holds more than once loses only the picked copies.
+        positions: Vec<u32>,
     },
     MoveInPlaylist {
         playlist_id: String,
@@ -1148,12 +1262,24 @@ pub enum Action {
     /// Send the account to a receiver found on the local network.
     ActivateReceiver(Box<crate::zeroconf::Receiver>),
     RefreshDevices,
+    /// List this computer's audio outputs for the device picker.
+    ListOutputDevices,
+    /// Start Spotifast when the person logs in, this way, or not at all.
+    SetStartWithComputer(Option<fastframe_autostart::Start>),
+    /// Play through this output, by name; `None` is the system default.
+    SetAudioDevice(Option<String>),
     /// Empty Next up of its queued songs, keeping the context's own.
     ClearQueue,
     /// Save the current and upcoming queue as a playlist.
     SaveQueueAsPlaylist,
     /// Save a radio page's songs to a new playlist, by the seed's URI.
     SaveRadio(String),
+    /// Hide a song in one of Spotify's playlists, or show it again (#779).
+    SetHiddenInPlaylist {
+        playlist_uri: String,
+        track_uri: String,
+        hidden: bool,
+    },
     RefreshQueue,
     CopyLink(String),
     /// Copy picked songs' links, one per line, and remember the songs so a
@@ -1166,6 +1292,10 @@ pub enum Action {
     },
     /// Open a web page in the browser.
     OpenUrl(String),
+    SetPrereleaseSaved {
+        uri: String,
+        saved: bool,
+    },
     OpenInSpotify(String),
     Search(String),
     /// The search field was emptied or its selection typed over, so the
@@ -1173,6 +1303,7 @@ pub enum Action {
     EndSearchRun,
     ForgetSearch(String),
     SetSearchFilter(SearchFilter),
+    SetTopPeriod(TopPeriod),
     FocusSearch,
     LoadMore(Page),
     LoadWindow {
@@ -1196,9 +1327,19 @@ pub enum Action {
     /// Add, replace, or remove the optional personal Web API app.
     ConfigurePersonalWebApp,
     OpenPersonalAppSetup,
+    /// The listener closed the "Spotify is being slow" banner.
+    CloseSlowBanner,
+    /// The listener closed the banner saying Spotify refused a song's
+    /// audio key.
+    CloseAudioKeyBanner,
+    /// Opens the device picker, to play on a device that fetches its own
+    /// audio. Unlike [`Action::ToggleDevicesPopup`] it never closes it.
+    PlayOnAnotherDevice,
     ToggleSidebar,
     ToggleQueuePanel,
     ToggleLyricsPanel,
+    /// Show or hide what friends are listening to, in the right panel.
+    ToggleFriendsPanel,
     SetLyricsFullscreen(bool),
     LyricsLineShown(Option<usize>),
     FollowLyrics,
@@ -1216,7 +1357,11 @@ pub enum Action {
     SetLanguage(crate::settings::LanguageChoice),
     OpenThemesFolder,
     SetCustomTheme(String),
+    /// Follow system shows this palette file (or Spotifast's own with
+    /// `None`) while the system is in this appearance.
+    SetPairTheme(fastframe_theme::Base, Option<String>),
     ReloadThemes,
+    SetLibraryByYou(bool),
     SetLibrarySort {
         shelf: crate::settings::LibraryShelf,
         sort: crate::settings::LibrarySort,
@@ -1252,6 +1397,11 @@ pub enum Action {
     /// Windows: draw Spotifast's own title bar instead of the standard one.
     SetCustomTitlebar(bool),
     OpenSkinsFolder,
+    /// Pick the folder a playlist's local files play from.
+    ChooseLocalFilesFolder,
+    /// Stop playing local files.
+    ForgetLocalFilesFolder,
+    OpenLocalFilesFolder,
     /// Pick a different skin each time the mini player opens.
     SetRandomSkin(bool),
     /// Cycle bars, scope, and off.
@@ -1272,6 +1422,25 @@ pub enum Action {
     SetEqPreamp(f32),
     /// One of Winamp's presets, by its place in the list.
     ApplyEqPreset(usize),
+    /// A preset saved here, by name: its preamp and bands.
+    ApplyUserEqPreset(String),
+    /// Switch rate and reverb on or off.
+    ToggleEffects,
+    /// The rate in percent; moving it switches effects on.
+    SetEffectsRate(u16),
+    /// Bass in decibels, -12 to 12; moving it switches effects on.
+    SetEffectsBass(f32),
+    /// How much reverb is heard, 0 to 1; moving it switches effects on.
+    SetReverbMix(f32),
+    /// The reverb's room size, 0 to 1; moving it switches effects on.
+    SetReverbRoom(f32),
+    /// Normal speed, flat bass, no reverb, effects off.
+    ResetEffects,
+    /// Save the preamp and bands as a preset of this name, replacing one
+    /// already saved under it.
+    SaveEqPreset(String),
+    /// Forget a saved preset, by name.
+    DeleteEqPreset(String),
     /// The balance, -1 all left to 1 all right.
     SetBalance(f32),
     ToggleMono,

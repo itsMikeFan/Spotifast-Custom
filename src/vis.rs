@@ -19,8 +19,9 @@ use librespot_playback::{NUM_CHANNELS, SAMPLE_RATE};
 /// Half a second of audio.
 const KEPT: usize = SAMPLE_RATE as usize / 2;
 /// How far behind the newest sample the visualiser looks, so that it shows
-/// what the speaker is playing rather than what the sink has queued.
-pub const LAG: usize = SAMPLE_RATE as usize * 3 / 20;
+/// what the speaker is playing rather than what the sink has queued: the
+/// sink keeps 180 to 200 ms queued, and the device holds a little more.
+pub const LAG: usize = SAMPLE_RATE as usize / 5;
 /// Samples that go into one spectrum.
 pub const FFT_SAMPLES: usize = 512;
 const SPECTRUM_BINS: usize = FFT_SAMPLES / 2;
@@ -142,12 +143,14 @@ impl AudioTap {
     }
 }
 
-/// Runs the equalizer and taps the signal before passing it to the real sink.
+/// Runs the equalizer and effects and taps the signal before passing it to
+/// the real sink.
 pub struct Tapped {
     inner: Box<dyn Sink>,
     control: Arc<crate::sink::AudioControl>,
     tap: Arc<AudioTap>,
     eq: crate::eq::Processor,
+    effects: crate::effects::Processor,
     /// Player volume, used to calculate the limiter ceiling.
     volume: Box<dyn VolumeGetter + Send>,
     /// Whether this wrapper applies volume after the tap. Otherwise the inner
@@ -161,6 +164,8 @@ pub struct Tapped {
 }
 
 impl Tapped {
+    // Each argument is a separate handle the engine shares with the UI.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         inner: Box<dyn Sink>,
         control: Arc<crate::sink::AudioControl>,
@@ -168,6 +173,7 @@ impl Tapped {
         volume: Box<dyn VolumeGetter + Send>,
         applies_volume: bool,
         eq: crate::eq::SharedEq,
+        effects: crate::effects::SharedEffects,
         normalisation: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
@@ -175,6 +181,7 @@ impl Tapped {
             control,
             tap,
             eq: crate::eq::Processor::new(eq),
+            effects: crate::effects::Processor::new(effects),
             volume,
             applies_volume,
             limiter: crate::limiter::Limiter::new(f64::from(SAMPLE_RATE)),
@@ -211,15 +218,17 @@ impl Sink for Tapped {
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
         if self.control.take_processing_reset() {
             self.eq.reset();
+            self.effects.reset();
             self.limiter = crate::limiter::Limiter::new(f64::from(SAMPLE_RATE));
             self.tap.clear();
         }
         let packet = match packet {
             AudioPacket::Samples(mut samples) => {
                 self.eq.process(&mut samples);
-                // Post-EQ, pre-volume, pre-normalisation: the equalizer
-                // shapes what the bars show; the volume knob and the
-                // loudness housekeeping never move them.
+                let mut samples = self.effects.process(samples);
+                // Post-EQ and effects, pre-volume, pre-normalisation: what
+                // is heard shapes what the bars show; the volume knob and
+                // the loudness housekeeping never move them.
                 let factor = f64::from_bits(
                     self.normalisation
                         .load(std::sync::atomic::Ordering::Relaxed),
@@ -681,6 +690,14 @@ mod tests {
         control: Arc<crate::sink::AudioControl>,
         eq: crate::eq::SharedEq,
     ) -> (Tapped, Arc<Mutex<Vec<f64>>>) {
+        recorded_tap_with(control, eq, crate::effects::shared())
+    }
+
+    fn recorded_tap_with(
+        control: Arc<crate::sink::AudioControl>,
+        eq: crate::eq::SharedEq,
+        effects: crate::effects::SharedEffects,
+    ) -> (Tapped, Arc<Mutex<Vec<f64>>>) {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let tapped = Tapped::new(
             Box::new(RecordedSink(Arc::clone(&recorded))),
@@ -689,9 +706,27 @@ mod tests {
             Box::new(librespot_playback::mixer::NoOpVolume),
             false,
             eq,
+            effects,
             Arc::new(std::sync::atomic::AtomicU64::new(1.0f64.to_bits())),
         );
         (tapped, recorded)
+    }
+
+    #[test]
+    fn effects_run_between_the_equalizer_and_the_tap() {
+        let control = crate::sink::AudioControl::new(crate::sink::DEFAULT_BUFFER_MS);
+        let effects = crate::effects::shared();
+        {
+            let mut settings = effects.lock().unwrap();
+            settings.on = true;
+            settings.rate_percent = 150;
+        }
+        let (mut tapped, recorded) = recorded_tap_with(control, crate::eq::shared(), effects);
+        for _ in 0..20 {
+            write_level(&mut tapped, 0.25);
+        }
+        let frames = recorded.lock().unwrap().len() / 2;
+        assert!(frames.abs_diff(20_480 * 2 / 3) <= 64, "{frames} frames");
     }
 
     fn write_level(tapped: &mut Tapped, level: f64) {
@@ -705,7 +740,7 @@ mod tests {
 
     #[test]
     fn replacing_a_track_discards_held_audio_before_its_silent_intro() {
-        for equalizer_on in [false, true] {
+        for (equalizer_on, reverb_on) in [(false, false), (true, false), (false, true)] {
             let control = crate::sink::AudioControl::new(crate::sink::DEFAULT_BUFFER_MS);
             let eq = crate::eq::shared();
             {
@@ -713,7 +748,14 @@ mod tests {
                 settings.on = equalizer_on;
                 settings.bands_db[0] = 12.0;
             }
-            let (mut tapped, recorded) = recorded_tap(Arc::clone(&control), eq);
+            let effects = crate::effects::shared();
+            {
+                let mut settings = effects.lock().unwrap();
+                settings.on = reverb_on;
+                settings.reverb_mix = 1.0;
+                settings.reverb_room = 1.0;
+            }
+            let (mut tapped, recorded) = recorded_tap_with(Arc::clone(&control), eq, effects);
             write_level(&mut tapped, 0.25);
             control.interrupt();
             // Old packets can still arrive while the replacement is loading.
@@ -724,7 +766,7 @@ mod tests {
             write_level(&mut tapped, 0.0);
             assert!(
                 recorded.lock().unwrap().iter().all(|sample| *sample == 0.0),
-                "the old limiter delay and equalizer tail must not reach the new track"
+                "the old limiter delay, equalizer and reverb tails must not reach the new track"
             );
         }
     }

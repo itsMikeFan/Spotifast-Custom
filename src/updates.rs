@@ -18,10 +18,13 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
         executable_names: &["Spotifast"],
         legacy_bundle_names: &[],
     },
-    // Releases are verified against checksums.txt alone until they are
-    // signed. Only a version shipped after the first signed release may
-    // carry the key: from then on an unsigned release is refused.
-    publisher_key: None,
+    // Releases publish an Ed25519 signature for checksums.txt. Require it
+    // before downloading an update, using the release workflow's public key.
+    publisher_key: Some(include_str!("../assets/update-public-key.hex")),
+    // Releases build their AppImages before publishing, so the signed
+    // checksums.txt lists them (#737): an AppImage replaces itself with the
+    // next one.
+    appimage: true,
     ..UpdateConfig::new(
         "crmne/spotifast",
         "Spotifast",
@@ -30,8 +33,15 @@ pub const CONFIG: UpdateConfig = UpdateConfig {
     )
 };
 
+/// This copy carries local changes (the audio effects) that an official
+/// release would replace, so it never checks for, downloads or installs one.
+const CUSTOM_BUILD: bool = true;
+
 /// An updater on Spotifast's HTTP client, through the configured proxy.
 pub fn updater(proxy: &crate::settings::ProxyConfig) -> anyhow::Result<Updater> {
+    if CUSTOM_BUILD {
+        anyhow::bail!("This custom build of Spotifast doesn't update itself.");
+    }
     let builder = crate::http::blocking_builder(proxy).map_err(anyhow::Error::msg)?;
     Ok(Updater::new(CONFIG, ReqwestTransport::new(builder)?))
 }
@@ -41,8 +51,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn this_custom_build_never_updates_itself() {
+        let refused = updater(&crate::settings::ProxyConfig::Off).err().unwrap();
+        assert!(refused.to_string().contains("doesn't update itself"));
+    }
+
+    #[test]
     fn update_config_is_valid() {
         CONFIG.validate().unwrap();
         assert_eq!(CONFIG.current_version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn updates_require_the_release_signing_key() {
+        assert!(
+            CONFIG.publisher_key.is_some(),
+            "updates must require a publisher signature"
+        );
+        CONFIG.validate().unwrap();
+    }
+
+    /// An AppImage may replace itself only because the release workflow
+    /// builds the AppImages into the signed checksums.txt;
+    /// packaging/test-release-names.py checks that side.
+    #[test]
+    fn appimages_update_themselves() {
+        const { assert!(CONFIG.appimage) };
     }
 }

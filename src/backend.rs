@@ -15,19 +15,19 @@ use tokio::sync::{mpsc, watch};
 
 use crate::api::models::*;
 use crate::api::{
-    AccountId, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest, PlaylistId,
-    SessionState, TokenProvider, WebTokens,
+    AccountId, ApiClient, ApiError, ApiGateway, ApiSource, NetActivity, Operation, PlayRequest,
+    PlaylistId, SessionState, TokenProvider, WebTokens,
 };
 use crate::credentials::{
     Grant as StoredGrant, Lease as CredentialLease, Slot as CredentialSlot,
     Store as CredentialStore,
 };
 use crate::http::Http;
-use crate::images::{ArtLoader, accent_color};
-use crate::model::PlaylistCache;
+use crate::images::{ArtLoader, art_palette};
+use crate::model::{PlaylistCache, TopPeriod};
 use crate::paths::AppDirs;
 use crate::player::{
-    Engine, EngineConfig, EngineEvent, Heard, LocalState, PlaybackResume, PlayerCommand,
+    Engine, EngineConfig, EngineEvent, Heard, KeptPlayer, LocalState, PlaybackResume, PlayerCommand,
 };
 use crate::session_reads;
 use crate::settings::ProxyConfig;
@@ -44,11 +44,32 @@ const MAX_PENDING_ALBUM_TYPES: usize = 50;
 const AUDIOBOOK_BATCH: usize = 50;
 /// How long resolving a radio station and its songs may take.
 const RADIO_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The songs in `folder` and its subfolders by the `spotify:local:` URIs
+/// they play for, found exactly as the player finds them, so the songs a
+/// playlist lists that will play are the ones shown as playable, and each
+/// one's file can be read for its cover and lyrics.
+fn local_file_uris(
+    folder: &std::path::Path,
+) -> std::collections::HashMap<String, std::path::PathBuf> {
+    librespot_playback::local_file::create_local_file_lookup(&[folder.to_path_buf()])
+        .iter()
+        .map(|(uri, path)| (uri.to_uri(), path.to_path_buf()))
+        .collect()
+}
 /// Newest episodes read from each saved podcast for Home's podcast shelf.
 const HOME_EPISODES_PER_SHOW: u32 = 5;
 pub const PLAYLIST_PAGE_SIZE: u32 = 50;
 const RECONNECT_WINDOW: Duration = Duration::from_secs(600);
 const RECONNECT_LIMIT: usize = 6;
+/// Each followed artist's newest albums and singles the New releases
+/// fallback asks for.
+const NEW_RELEASES_PER_ARTIST: u32 = 10;
+/// Seconds between background attempts to bring the engine back with the
+/// saved playback grant after a connection failure that was not a rejected
+/// grant (#818). The last delay repeats, so a session lost overnight comes
+/// back on its own at the cost of one connection attempt every ten minutes.
+const ENGINE_RETRY_DELAYS: [u64; 6] = [5, 15, 60, 120, 300, 600];
 
 async fn connect_engine_with_deadline<F: std::future::Future>(
     connect: F,
@@ -78,10 +99,34 @@ fn defer_engine_replace(engine_busy: bool, restart_pending: &mut bool) -> bool {
 pub enum AuthStatus {
     Starting,
     SignedOut,
-    WaitingForBrowser { url: String },
+    WaitingForBrowser {
+        url: String,
+    },
     Connecting,
-    Connected { username: String },
+    Connected {
+        username: String,
+    },
     Failed(String),
+    /// Spotify turned the sign-in down for a reason the sign-in screen
+    /// explains in the listener's language and shows how to fix.
+    Refused(SignInProblem),
+}
+
+/// Why Spotify turned a sign-in down, for the sign-in screen to explain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SignInProblem {
+    /// What was pasted is not shaped like a Client ID.
+    MalformedClientId,
+    /// Spotify has never issued the Client ID.
+    UnknownClient,
+    /// The personal app does not let this account in: it is not the
+    /// account that created the app, or that account has no Premium.
+    AccountNotAllowed,
+    /// Spotify refused the grant from before 0.14.2 that came through the
+    /// app Spotifast used to share, and there is no personal app to go on.
+    SharedRetired,
+    /// Spotify refused the personal app's saved grant.
+    Expired,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,7 +136,10 @@ pub enum RemoteAction {
     Next,
     Previous,
     Seek,
-    Volume,
+    /// Echo the adjustment's serial so late replies cannot settle a newer one.
+    Volume {
+        request: u64,
+    },
     Shuffle,
     Repeat,
 }
@@ -123,6 +171,7 @@ pub enum ApiRequest {
         limit: u32,
     },
     TopTracks {
+        period: TopPeriod,
         offset: u32,
         full: bool,
         generation: u64,
@@ -135,9 +184,28 @@ pub enum ApiRequest {
         seed_artists: Vec<String>,
         generation: u64,
     },
-    Discover {
-        term: String,
+    MadeForYou {
         generation: u64,
+        force: bool,
+    },
+    /// The latest releases from the artists the account follows.
+    NewReleases {
+        generation: u64,
+    },
+    /// Every song of these releases, for the New releases page.
+    NewReleaseTracks {
+        albums: Vec<Album>,
+        generation: u64,
+    },
+    /// The songs hidden in Spotify's playlists, over the playback session.
+    HiddenSongs {
+        generation: u64,
+    },
+    /// Hide a song in one of Spotify's playlists, or show it again.
+    SetHiddenInPlaylist {
+        playlist_uri: String,
+        track_uri: String,
+        hidden: bool,
     },
     MyPlaylists {
         offset: u32,
@@ -187,18 +255,6 @@ pub enum ApiRequest {
         playlist_name: String,
         uris: Vec<String>,
         position: Option<u32>,
-    },
-    /// Read every row of a playlist to list its duplicate songs.
-    FindPlaylistDuplicates {
-        playlist_id: String,
-        playlist_name: String,
-    },
-    /// Remove every copy of `uris`, then put back `readd` at final positions.
-    RemovePlaylistDuplicates {
-        playlist_id: String,
-        uris: Vec<String>,
-        readd: Vec<(String, u32)>,
-        snapshot_id: Option<String>,
     },
     RemoveFromPlaylist {
         playlist_id: String,
@@ -292,7 +348,8 @@ pub enum ApiRequest {
         offset: u32,
     },
     /// The newest episodes of a few saved podcasts, for Home. The shows
-    /// are read one after another, not all at once.
+    /// are read together, as many at once as the client lets requests
+    /// run; a rate limit, quota or lost sign-in stops the rest.
     HomeEpisodes {
         shows: Vec<Show>,
         generation: u64,
@@ -337,6 +394,7 @@ pub enum ApiRequest {
 }
 
 impl ApiRequest {
+    /// Identifies reads that share the background request concurrency limit.
     fn background(&self) -> bool {
         matches!(
             self,
@@ -345,7 +403,10 @@ impl ApiRequest {
                 | Self::TopTracks { .. }
                 | Self::TopArtists { .. }
                 | Self::Recommendations { .. }
-                | Self::Discover { .. }
+                | Self::MadeForYou { .. }
+                | Self::NewReleases { .. }
+                | Self::NewReleaseTracks { .. }
+                | Self::HiddenSongs { .. }
                 | Self::MyPlaylists { .. }
                 | Self::PlaylistSample { .. }
                 | Self::Contains { .. }
@@ -372,6 +433,7 @@ pub enum ApiResponse {
         result: ApiResult<CursorPage<PlayHistory>>,
     },
     TopTracks {
+        period: TopPeriod,
         offset: u32,
         full: bool,
         generation: u64,
@@ -385,10 +447,29 @@ pub enum ApiResponse {
         generation: u64,
         result: ApiResult<Vec<Track>>,
     },
-    Discover {
-        term: String,
+    MadeForYou {
         generation: u64,
+        personalized: bool,
         result: ApiResult<Vec<Playlist>>,
+        top_mixes: ApiResult<Vec<Playlist>>,
+    },
+    NewReleases {
+        generation: u64,
+        result: ApiResult<Vec<Album>>,
+    },
+    NewReleaseTracks {
+        generation: u64,
+        result: ApiResult<Vec<Track>>,
+    },
+    HiddenSongs {
+        generation: u64,
+        result: ApiResult<Vec<(String, String)>>,
+    },
+    HiddenInPlaylistSet {
+        playlist_uri: String,
+        track_uri: String,
+        hidden: bool,
+        result: ApiResult<()>,
     },
     MyPlaylists {
         offset: u32,
@@ -429,11 +510,6 @@ pub enum ApiResponse {
         items: Vec<PlayableItem>,
         position: Option<u32>,
         result: ApiResult<Vec<String>>,
-    },
-    PlaylistDuplicatesFound {
-        playlist_id: String,
-        playlist_name: String,
-        result: ApiResult<Vec<Option<PlayableItem>>>,
     },
     PlaylistItemsChanged {
         id: String,
@@ -609,8 +685,29 @@ struct PlaylistCacheWrite {
     next_offset: Option<u32>,
 }
 
+/// What the app asks of its login registration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutostartRequest {
+    /// Read what the system has registered.
+    Read,
+    /// Register this way, or remove the registration with `None`.
+    Set(Option<fastframe_autostart::Start>),
+}
+
+/// Spotifast's registration to start at login. The hidden start passes
+/// `--start-hidden`, which the command line takes.
+pub fn autostart() -> fastframe_autostart::Autostart {
+    fastframe_autostart::Autostart::new("spotifast", "Spotifast")
+}
+
 pub enum Command {
     OpenThemesFolder,
+    /// Read or change the login registration, off the UI thread: it reads
+    /// and writes a file, the registry or D-Bus, and the Flatpak portal may
+    /// ask the person first.
+    Autostart(AutostartRequest),
+    /// Read the names of this computer's audio outputs, off the UI thread.
+    ListOutputDevices,
     ProxyRestored {
         lease: CredentialLease,
         result: Result<crate::credentials::Loaded, crate::credentials::Error>,
@@ -632,10 +729,19 @@ pub enum Command {
         selected:
             std::pin::Pin<Box<dyn std::future::Future<Output = Option<rfd::FileHandle>> + Send>>,
     },
+    ChooseLocalFilesFolder {
+        selected:
+            std::pin::Pin<Box<dyn std::future::Future<Output = Option<rfd::FileHandle>> + Send>>,
+    },
+    /// Find the songs in the local files folder, off the UI thread, as the
+    /// player does when it starts.
+    ScanLocalFiles(std::path::PathBuf),
     /// Start (or restart) the Web API sign-in in the browser.
     SignIn {
         request: u64,
         config: ProxyConfig,
+        /// The listener's own app, from the sign-in screen.
+        client_id: Option<String>,
     },
     CancelSignIn,
     SignOut,
@@ -653,8 +759,9 @@ pub enum Command {
     Api(ApiRequest),
     ApiFinished {
         generation: u64,
+        home_account: Option<AccountId>,
         response: Box<ApiResponse>,
-        expired: Option<ApiSource>,
+        expired: Vec<ApiSource>,
         shared_lease: CredentialLease,
         personal_lease: CredentialLease,
     },
@@ -709,6 +816,10 @@ pub enum Command {
     NetworkStatus(bool),
     /// Internal: librespot's session ended on its own.
     Reconnect,
+    /// Internal: the backoff after a failed engine connection has passed.
+    RetryEngine {
+        generation: u64,
+    },
     /// Look for Spotify Connect receivers on the local network.
     DiscoverReceivers,
     /// Send the account to a receiver so it joins Spotify Connect.
@@ -757,6 +868,12 @@ pub enum Command {
     },
     /// Resolve user ids to display names through the streaming session.
     UserNames(Vec<String>),
+    /// Read Spotify's play counts for an album's songs or an artist's
+    /// popular songs, by the album's or the artist's URI.
+    PlayCounts(String),
+    /// Read what friends are listening to through the streaming session,
+    /// for the app's request generation.
+    FriendActivity(u64),
     LoadLikedSongsCache {
         generation: u64,
     },
@@ -778,6 +895,36 @@ pub enum Command {
     Radio {
         seed: String,
         generation: u64,
+    },
+    SetPrereleaseSaved {
+        uri: String,
+        saved: bool,
+        generation: u64,
+    },
+    /// Remove exactly these rows of a playlist through the streaming
+    /// session, leaving the song's other copies (#937). Answers as
+    /// `ApiResponse::PlaylistItemsChanged`.
+    RemovePlaylistRows {
+        playlist_id: String,
+        rows: Vec<session_reads::RemovedRow>,
+    },
+    PrereleaseSaved {
+        session_generation: u64,
+        uri: String,
+        saved: bool,
+        generation: u64,
+        result: Result<(), String>,
+    },
+    /// Resolve a countdown page once local playback is ready.
+    Prerelease {
+        uri: String,
+        generation: u64,
+    },
+    PrereleaseResolved {
+        session_generation: u64,
+        uri: String,
+        generation: u64,
+        result: Result<Box<crate::prerelease::Prerelease>, String>,
     },
     /// Internal: a radio finished resolving for the session it started in.
     RadioResolved {
@@ -812,9 +959,19 @@ pub struct LyricsRequest {
     /// The track the answer is for, so a stale one is ignored.
     pub uri: String,
     pub query: crate::lyrics::Query,
+    /// The local file a `spotify:local:` track plays from, whose own
+    /// lyrics come before LRCLIB's.
+    pub local_file: Option<std::path::PathBuf>,
 }
 
 pub enum Event {
+    /// The folder picked in the local files dialog; `None` when cancelled.
+    LocalFilesFolderChosen(Option<std::path::PathBuf>),
+    /// The songs in `folder`, by the `spotify:local:` URIs they play for.
+    LocalFiles {
+        folder: std::path::PathBuf,
+        uris: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
+    },
     ProxyRestored {
         config: ProxyConfig,
         password: Option<crate::credentials::ProxyPassword>,
@@ -848,6 +1005,22 @@ pub enum Event {
     Playback(LocalPlayback),
     /// Receivers seen on the local network that Spotify has not listed.
     Receivers(Vec<crate::zeroconf::Receiver>),
+    /// This computer's audio outputs, for the device picker.
+    OutputDevices(Result<Vec<fastframe_audio::DeviceInfo>, String>),
+    /// Local playback opened on the device an older build saved by `name`,
+    /// whose `id` the setting holds from now on.
+    AudioDeviceFound {
+        name: String,
+        id: String,
+    },
+    /// Cast advertisements ready before the final browse/probe reconciliation.
+    ReceiversProgress(crate::zeroconf::ReceiverUpdates),
+    /// The login registration after `request`: what the system has now, or
+    /// why the change failed.
+    Autostart {
+        request: AutostartRequest,
+        result: Result<fastframe_autostart::State, String>,
+    },
     ReceiverActivated {
         name: String,
         result: Result<(), String>,
@@ -857,6 +1030,8 @@ pub enum Event {
     Accent {
         url: String,
         color: [u8; 3],
+        /// The cover's colours, the accent first, for the visualizer.
+        palette: Vec<[u8; 3]>,
     },
     Error(String),
     /// GitHub answered an update check, or the request failed.
@@ -888,22 +1063,47 @@ pub enum Event {
         snapshot: String,
         success: bool,
     },
-    /// A user id resolved to a display name (`None` when nothing answers).
+    /// What friends are listening to, newest first, or why it could not be
+    /// read, answering the request of `generation`.
+    FriendActivity {
+        generation: u64,
+        result: Result<Vec<session_reads::FriendActivity>, String>,
+    },
+    /// A user id resolved to a display name and avatar (each `None` when
+    /// nothing answers).
     UserName {
         id: String,
         name: Option<String>,
+        image: Option<String>,
+    },
+    /// Play counts by track URI for the album or artist `uri`, or why they
+    /// could not be read.
+    PlayCounts {
+        uri: String,
+        result: Result<std::collections::HashMap<String, u64>, String>,
     },
     /// Saved shows that Spotify's metadata marks as audiobooks. librespot
     /// cannot play them, so the Podcasts shelf leaves them out.
     AudiobookShows(Vec<String>),
     /// The header the streaming session read for a library playlist the
     /// Web API listed blank.
-    PlaylistHeader(crate::api::models::Playlist),
+    PlaylistHeader(Box<crate::api::models::Playlist>),
     /// The songs of the radio seeded by `seed`, for the request `generation`.
     Radio {
         seed: String,
         generation: u64,
         result: Result<Vec<crate::api::models::Track>, String>,
+    },
+    Prerelease {
+        uri: String,
+        generation: u64,
+        result: Result<Box<crate::prerelease::Prerelease>, String>,
+    },
+    PrereleaseSaved {
+        uri: String,
+        saved: bool,
+        generation: u64,
+        result: Result<(), String>,
     },
     /// Whether Spotify's internal metadata positively identifies an album as an EP.
     AlbumType {
@@ -914,6 +1114,8 @@ pub enum Event {
     WebApp {
         client_id: Option<String>,
     },
+    /// Whether a shared grant from before 0.14.2 is signed in.
+    SharedGrant(bool),
     LikedSongsCache {
         account_id: String,
         generation: u64,
@@ -974,6 +1176,8 @@ pub struct Backend {
     #[cfg(test)]
     remote_shuffle_requests: std::sync::Mutex<Vec<ApiRequest>>,
     #[cfg(test)]
+    transfer_requests: std::sync::Mutex<Vec<ApiRequest>>,
+    #[cfg(test)]
     queue_requests: std::sync::Mutex<Vec<ApiRequest>>,
     #[cfg(test)]
     queued_tracks: std::sync::Mutex<Vec<String>>,
@@ -986,8 +1190,12 @@ pub struct Backend {
     #[cfg(test)]
     library_cache_stores: std::sync::Mutex<Vec<crate::account_cache::Cache<Vec<Playlist>>>>,
     #[cfg(test)]
+    playlist_row_removals: std::sync::Mutex<Vec<(String, Vec<session_reads::RemovedRow>)>>,
+    #[cfg(test)]
     home_cache_stores:
         std::sync::Mutex<Vec<crate::account_cache::Cache<crate::model::HomeSnapshot>>>,
+    #[cfg(test)]
+    top_tracks_requests: std::sync::Mutex<Vec<(TopPeriod, u32, bool, u64)>>,
 }
 
 impl Backend {
@@ -1067,6 +1275,8 @@ impl Backend {
             #[cfg(test)]
             remote_shuffle_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            transfer_requests: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
             queue_requests: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
             queued_tracks: std::sync::Mutex::new(Vec::new()),
@@ -1079,7 +1289,11 @@ impl Backend {
             #[cfg(test)]
             library_cache_stores: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            playlist_row_removals: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
             home_cache_stores: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            top_tracks_requests: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1102,6 +1316,13 @@ impl Backend {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(cache.clone());
+        }
+        #[cfg(test)]
+        if let Command::RemovePlaylistRows { playlist_id, rows } = &command {
+            self.playlist_row_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((playlist_id.clone(), rows.clone()));
         }
         #[cfg(test)]
         if let Command::StoreHomeCache(cache) = &command {
@@ -1143,6 +1364,19 @@ impl Backend {
         });
     }
 
+    /// Construct the folder dialog on the UI thread, like the cover's.
+    pub fn choose_local_files_folder(&self) {
+        if self.offline {
+            return;
+        }
+        let selected = rfd::AsyncFileDialog::new()
+            .set_title("Choose the local files folder")
+            .pick_folder();
+        self.send(Command::ChooseLocalFilesFolder {
+            selected: Box::pin(selected),
+        });
+    }
+
     pub fn api(&self, request: ApiRequest) {
         #[cfg(test)]
         if matches!(
@@ -1178,6 +1412,10 @@ impl Backend {
                 .lock()
                 .unwrap()
                 .push(request.clone());
+        }
+        #[cfg(test)]
+        if matches!(request, ApiRequest::Transfer { .. }) {
+            self.transfer_requests.lock().unwrap().push(request.clone());
         }
         #[cfg(test)]
         if matches!(
@@ -1225,7 +1463,32 @@ impl Backend {
                     *generation,
                 ));
         }
+        #[cfg(test)]
+        if let ApiRequest::TopTracks {
+            period,
+            offset,
+            full,
+            generation,
+        } = &request
+        {
+            self.top_tracks_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push((*period, *offset, *full, *generation));
+        }
         self.send(Command::Api(request));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_playlist_row_removals(
+        &self,
+    ) -> Vec<(String, Vec<session_reads::RemovedRow>)> {
+        std::mem::take(
+            &mut *self
+                .playlist_row_removals
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     #[cfg(test)]
@@ -1257,6 +1520,16 @@ impl Backend {
         std::mem::take(
             &mut *self
                 .home_episode_requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_top_tracks_requests(&self) -> Vec<(TopPeriod, u32, bool, u64)> {
+        std::mem::take(
+            &mut *self
+                .top_tracks_requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
@@ -1300,6 +1573,11 @@ impl Backend {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         )
+    }
+
+    #[cfg(test)]
+    pub fn take_transfer_requests(&self) -> Vec<ApiRequest> {
+        std::mem::take(&mut *self.transfer_requests.lock().unwrap())
     }
 
     #[cfg(test)]
@@ -1554,8 +1832,15 @@ struct Worker {
     engine_proxy: Option<reqwest::Url>,
     web_client_id: Option<String>,
     http: Http,
+    /// Friends' names and avatars and their playlists' names, kept between
+    /// Friend activity polls.
+    friend_names: Arc<tokio::sync::Mutex<session_reads::FriendNames>>,
     api: Arc<ApiGateway>,
+    made_for_you: Arc<crate::made_for_you::MadeForYou>,
+    new_releases: Arc<crate::new_releases::NewReleases>,
     connect: Arc<crate::sonos::Controller>,
+    /// Reopening or refreshing the picker reuses an in-flight browse.
+    receiver_discovery: Option<tokio::task::JoinHandle<()>>,
     background_session: Arc<tokio::sync::Semaphore>,
     art: ArtLoader,
     events: std::sync::mpsc::Sender<Event>,
@@ -1578,6 +1863,7 @@ struct Worker {
     playlist_header_lookup: PlaylistHeaderLookup,
     /// Radios asked for before the streaming session was ready, by seed.
     radio_waiting: BTreeMap<String, u64>,
+    prerelease_waiting: Option<(String, u64)>,
     /// True while a playback grant or engine connection is in flight, so a
     /// second attempt does not pile up.
     engine_busy: bool,
@@ -1597,14 +1883,48 @@ struct Worker {
     resume: Option<PlaybackResume>,
     /// A pickup in flight: the load to repeat and how often it was tried.
     resume_verify: Option<(PlaybackResume, u8)>,
+    /// The player of an engine whose session dropped, still playing what it
+    /// had fetched, for the next engine to carry on with (#268).
+    kept_player: Option<KeptPlayer>,
     network_reachable: bool,
     waiting_for_network: bool,
     engine_attempt: u64,
+    /// Failed engine connections in a row that the saved grant is retrying.
+    engine_retries: usize,
+    /// Bumped to drop a scheduled retry that is no longer wanted.
+    engine_retry_generation: u64,
+    /// The engine connection in flight is a background retry: it does not
+    /// announce itself, and its failure keeps the error already shown.
+    engine_retry_quiet: bool,
+    /// The user asked to set up playback and the saved grant is being tried
+    /// first. Only Spotify rejecting it opens the browser.
+    authorize_if_rejected: bool,
+}
+
+/// A failed Connect probe setup must still reconcile departed provisional rows.
+fn receiver_snapshot(
+    receivers: Vec<crate::zeroconf::Receiver>,
+    resolve: impl FnOnce(
+        Vec<crate::zeroconf::Receiver>,
+    ) -> anyhow::Result<Vec<crate::zeroconf::Receiver>>,
+) -> Vec<crate::zeroconf::Receiver> {
+    let cast = receivers
+        .iter()
+        .filter(|receiver| receiver.cast)
+        .cloned()
+        .collect();
+    match resolve(receivers) {
+        Ok(receivers) => receivers,
+        Err(error) => {
+            log::debug!("no receivers found on the network: {error}");
+            cast
+        }
+    }
 }
 
 impl Worker {
+    /// Initialize account-scoped dispatch state, Home reader and session background budget.
     #[allow(clippy::too_many_arguments)]
-    /// Initialize account-scoped dispatch state and the independent session background budget.
     fn new(
         dirs: AppDirs,
         engine_config: EngineConfig,
@@ -1636,9 +1956,13 @@ impl Worker {
             engine_proxy: None,
             web_client_id,
             api: Arc::new(ApiGateway::new(http.clone(), activity)),
+            made_for_you: Arc::new(crate::made_for_you::MadeForYou::new(http.clone())),
+            new_releases: Arc::new(crate::new_releases::NewReleases::new(http.clone())),
             connect: Arc::default(),
+            receiver_discovery: None,
             background_session: Arc::new(tokio::sync::Semaphore::new(4)),
             http,
+            friend_names: Arc::default(),
             art,
             events,
             commands,
@@ -1650,6 +1974,7 @@ impl Worker {
             audiobook_lookup: BTreeSet::new(),
             playlist_header_lookup: PlaylistHeaderLookup::default(),
             radio_waiting: BTreeMap::new(),
+            prerelease_waiting: None,
             engine_busy: false,
             search_tasks: Vec::new(),
             engine_restart_pending: false,
@@ -1661,9 +1986,14 @@ impl Worker {
             reconnects: Vec::new(),
             resume: None,
             resume_verify: None,
+            kept_player: None,
             network_reachable: true,
             waiting_for_network: false,
             engine_attempt: 0,
+            engine_retries: 0,
+            engine_retry_generation: 0,
+            engine_retry_quiet: false,
+            authorize_if_rejected: false,
         }
     }
 
@@ -1682,7 +2012,9 @@ impl Worker {
         Ok(restart)
     }
 
-    fn change_proxy(&mut self, request: u64, proxy: ProxyConfig, sign_in: bool) {
+    /// Applies a proxy, then signs in with `sign_in`'s Client ID when that
+    /// is the sign-in screen's button.
+    fn change_proxy(&mut self, request: u64, proxy: ProxyConfig, sign_in: Option<Option<String>>) {
         let result = self.apply_proxy(proxy.clone());
         if result.as_ref().is_ok_and(|restart| *restart) {
             self.replace_engine();
@@ -1699,8 +2031,8 @@ impl Worker {
         if applied {
             self.persist_proxy_password(&proxy);
             self.finish_proxy_restore();
-            if sign_in {
-                self.sign_in();
+            if let Some(client_id) = sign_in {
+                self.sign_in(client_id);
             }
         }
     }
@@ -1827,6 +2159,33 @@ impl Worker {
                 continue;
             }
             match command {
+                Command::ListOutputDevices => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    // Listing asks the sound system about every device,
+                    // which can take a moment; nothing is opened.
+                    tokio::task::spawn_blocking(move || {
+                        let devices =
+                            fastframe_audio::output_devices().map_err(|error| error.to_string());
+                        let _ = events.send(Event::OutputDevices(devices));
+                        waker.wake();
+                    });
+                }
+                Command::Autostart(request) => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let autostart = autostart();
+                        let result = match request {
+                            AutostartRequest::Read => Ok(autostart.state()),
+                            AutostartRequest::Set(start) => {
+                                autostart.set(start).map_err(|error| error.to_string())
+                            }
+                        };
+                        let _ = events.send(Event::Autostart { request, result });
+                        waker.wake();
+                    });
+                }
                 Command::OpenThemesFolder => {
                     let directory = self.dirs.config.join("themes");
                     let events = self.events.clone();
@@ -1878,6 +2237,32 @@ impl Worker {
                         waker.wake();
                     });
                 }
+                Command::ChooseLocalFilesFolder { selected } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        let folder = selected.await.map(|folder| folder.path().to_path_buf());
+                        let _ = events.send(Event::LocalFilesFolderChosen(folder));
+                        waker.wake();
+                    });
+                }
+                Command::ScanLocalFiles(folder) => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::spawn(async move {
+                        let scanned = folder.clone();
+                        let Ok(uris) =
+                            tokio::task::spawn_blocking(move || local_file_uris(&scanned)).await
+                        else {
+                            return;
+                        };
+                        let _ = events.send(Event::LocalFiles {
+                            folder,
+                            uris: Arc::new(uris),
+                        });
+                        waker.wake();
+                    });
+                }
                 Command::ChoosePlaylistCover {
                     id,
                     request,
@@ -1906,7 +2291,11 @@ impl Worker {
                     });
                 }
                 Command::Shutdown => break,
-                Command::SignIn { request, config } => self.change_proxy(request, config, true),
+                Command::SignIn {
+                    request,
+                    config,
+                    client_id,
+                } => self.change_proxy(request, config, Some(client_id)),
                 Command::CancelSignIn => {
                     self.authorization_attempt += 1;
                     if let Some(cancel) = self.cancel_signin.take() {
@@ -1946,22 +2335,24 @@ impl Worker {
                     self.engine_config = config;
                     self.replace_engine();
                 }
-                Command::ApplyProxy { request, config } => {
-                    self.change_proxy(request, config, false)
-                }
+                Command::ApplyProxy { request, config } => self.change_proxy(request, config, None),
                 Command::Player(command) => {
                     if matches!(&command, PlayerCommand::Load(_)) {
                         self.resume = None;
                     }
                     match &self.engine {
+                        // Until the new session picks the song up, it has
+                        // nothing to pause: the player does it (#268).
+                        Some(engine)
+                            if command == PlayerCommand::Toggle
+                                && engine.carrying()
+                                && engine.keep_player().toggle() => {}
                         Some(engine) => {
                             if let Err(error) = engine.command(command) {
                                 self.emit(Event::Error(format!("Playback error: {error}")));
                             }
                         }
-                        None => self.emit(Event::Error(
-                            "Local playback isn't set up on this computer yet".into(),
-                        )),
+                        None => self.player_without_engine(command),
                     }
                 }
                 Command::Api(ApiRequest::Search { query, serial }) => self.search(query, serial),
@@ -1970,6 +2361,7 @@ impl Worker {
                 }
                 Command::ApiFinished {
                     generation,
+                    home_account,
                     response,
                     expired,
                     shared_lease,
@@ -1978,23 +2370,53 @@ impl Worker {
                     if generation != *self.session.borrow() {
                         continue;
                     }
-                    if let Some(source) = expired {
-                        let lease = if source == ApiSource::Shared {
-                            shared_lease
-                        } else {
-                            personal_lease
-                        };
-                        if !lease.current() {
+                    // Home can finish after a browser reauthorization without
+                    // an explicit sign-out. Bind successful cards to both the
+                    // account and the grants that existed at dispatch.
+                    if let ApiResponse::MadeForYou { generation, .. } = response.as_ref() {
+                        if home_account.is_none() || home_account != self.api.account() {
                             continue;
                         }
-                        self.forget_web_grant(source);
-                        if source == ApiSource::Personal {
-                            self.emit(Event::WebApp { client_id: None });
+                        if !shared_lease.current() || !personal_lease.current() {
+                            // The same account renewed a grant. Retry under its
+                            // current leases so this shelf does not stay loading.
+                            self.dispatch(ApiRequest::MadeForYou {
+                                generation: *generation,
+                                force: false,
+                            });
+                            continue;
+                        }
+                    }
+                    if expired.iter().any(|source| {
+                        if *source == ApiSource::Shared {
+                            !shared_lease.current()
                         } else {
+                            !personal_lease.current()
+                        }
+                    }) {
+                        continue;
+                    }
+                    for source in expired {
+                        self.forget_web_grant(source);
+                        self.emit(match source {
+                            ApiSource::Personal => Event::WebApp { client_id: None },
+                            ApiSource::Shared => Event::SharedGrant(false),
+                        });
+                        // Either grant carries the session alone when the
+                        // other is gone; only losing the last one signs out.
+                        let other_ready = match source {
+                            ApiSource::Shared => self.api.personal_ready(),
+                            ApiSource::Personal => matches!(
+                                self.api.state(ApiSource::Shared),
+                                SessionState::Ready { .. }
+                            ),
+                        };
+                        if !other_ready {
                             self.signed_in = false;
-                            self.emit(Event::Auth(AuthStatus::Failed(
-                                "Your Spotify sign-in expired. Please sign in again.".into(),
-                            )));
+                            self.emit(Event::Auth(AuthStatus::Refused(match source {
+                                ApiSource::Shared => SignInProblem::SharedRetired,
+                                ApiSource::Personal => SignInProblem::Expired,
+                            })));
                         }
                     }
                     if let ApiResponse::Me(Ok(user)) = response.as_ref()
@@ -2018,6 +2440,14 @@ impl Worker {
                             );
                         }
                         _ => {}
+                    }
+                    if let ApiResponse::MadeForYou {
+                        result, top_mixes, ..
+                    } = response.as_ref()
+                    {
+                        for playlists in [result, top_mixes].into_iter().flatten() {
+                            self.api.observe_playlists(playlists);
+                        }
                     }
                     self.emit(Event::Api(response));
                 }
@@ -2110,6 +2540,15 @@ impl Worker {
                         }
                         if let Some(pending) = self.pending_authorization.take() {
                             self.sign_in_source(pending);
+                        } else if self.signed_in
+                            && self.api.state(ApiSource::Personal) == SessionState::Unavailable
+                            && self.api.state(ApiSource::Shared) == SessionState::Unavailable
+                        {
+                            // Choosing another app in Settings let go of the
+                            // only grant, and its sign-in never finished:
+                            // nothing is left to answer the app.
+                            self.signed_in = false;
+                            self.emit(Event::Auth(AuthStatus::SignedOut));
                         }
                     }
                 }
@@ -2117,6 +2556,7 @@ impl Worker {
                     self.finish_playback_authorization(attempt)
                 }
                 Command::Reconnect => self.reconnect_engine(),
+                Command::RetryEngine { generation } => self.retry_engine(generation),
                 Command::DiscoverReceivers => self.discover_receivers(),
                 Command::ActivateReceiver(receiver) => self.activate_receiver(*receiver),
                 Command::CheckForUpdates { manual, source } => {
@@ -2231,6 +2671,8 @@ impl Worker {
                     }
                 }
                 Command::UserNames(ids) => self.fetch_user_names(ids),
+                Command::PlayCounts(uri) => self.fetch_play_counts(uri),
+                Command::FriendActivity(generation) => self.fetch_friend_activity(generation),
                 Command::LoadLikedSongsCache { generation } => {
                     if let Some(account) = self.api.account() {
                         let account_id = account.as_str().to_string();
@@ -2313,6 +2755,48 @@ impl Worker {
                     self.playlist_header_lookup.enqueue(ids);
                     self.start_playlist_header_lookup();
                 }
+                Command::SetPrereleaseSaved {
+                    uri,
+                    saved,
+                    generation,
+                } => self.set_prerelease_saved(uri, saved, generation),
+                Command::RemovePlaylistRows { playlist_id, rows } => {
+                    self.remove_playlist_rows(playlist_id, rows)
+                }
+                Command::PrereleaseSaved {
+                    session_generation,
+                    uri,
+                    saved,
+                    generation,
+                    result,
+                } => {
+                    if self.signed_in && session_generation == *self.session.borrow() {
+                        self.emit(Event::PrereleaseSaved {
+                            uri,
+                            saved,
+                            generation,
+                            result,
+                        });
+                    }
+                }
+                Command::Prerelease { uri, generation } => {
+                    self.prerelease_waiting = Some((uri, generation));
+                    self.start_prerelease();
+                }
+                Command::PrereleaseResolved {
+                    session_generation,
+                    uri,
+                    generation,
+                    result,
+                } => {
+                    if self.signed_in && session_generation == *self.session.borrow() {
+                        self.emit(Event::Prerelease {
+                            uri,
+                            generation,
+                            result,
+                        });
+                    }
+                }
                 Command::Radio { seed, generation } => {
                     self.radio_waiting.insert(seed, generation);
                     self.start_radio();
@@ -2373,6 +2857,7 @@ impl Worker {
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
+        self.stop_kept_player();
         drop(cache_writes);
         let _ = cache_writer.await;
     }
@@ -2459,20 +2944,24 @@ impl Worker {
                         }
                         self.on_web_signed_in(source, token);
                     } else {
-                        // Signing in renews only the shared app's grant, so a
-                        // personal app has to be authorized again where it was
-                        // set up (#634).
+                        // A shared grant cannot be renewed any more, and a
+                        // personal app's is renewed by signing in with it, or
+                        // in Settings while a shared grant keeps the app
+                        // signed in (#634).
                         let message = if source == ApiSource::Shared {
-                            "Spotify permissions changed. Sign in again."
+                            "Spotify permissions changed. Sign in with your own Spotify app."
                         } else {
-                            "Spotify permissions changed for your personal app. \
-                             Authorize it again in Settings, under Account."
+                            "Spotify permissions changed for your personal app. Authorize it \
+                             again, with Sign in or in Settings, under Account."
                         };
                         self.emit(Event::Error(message.into()));
                     }
                 }
             }
             None | Some(StoredGrant::Proxy(_)) => {}
+        }
+        if slot == CredentialSlot::Playback {
+            self.start_prerelease();
         }
         if slot != CredentialSlot::Playback && self.web_tokens[slot.index()].is_none() {
             self.api.clear(if slot == CredentialSlot::Shared {
@@ -2581,6 +3070,9 @@ impl Worker {
         } else {
             self.api.clear(source);
         }
+        if source == ApiSource::Shared {
+            self.emit(Event::SharedGrant(false));
+        }
         let message = match source {
             ApiSource::Shared => format!("Shared Spotify sign-in failed: {error}"),
             ApiSource::Personal => format!("Personal app authorization failed: {error}"),
@@ -2592,9 +3084,27 @@ impl Worker {
                 SessionState::Ready { .. }
             ),
         };
-        if source == ApiSource::Shared || !other_ready {
+        let problem = match (source, &error) {
+            (ApiSource::Shared, ApiError::SignInExpired { .. }) => {
+                Some(SignInProblem::SharedRetired)
+            }
+            // Development Mode lets in only the accounts the app's owner
+            // allows, and none while the owner has no Premium.
+            (ApiSource::Personal, error) if error.status() == Some(403) => {
+                Some(SignInProblem::AccountNotAllowed)
+            }
+            (ApiSource::Personal, ApiError::SignInExpired { .. }) => Some(SignInProblem::Expired),
+            _ => None,
+        };
+        if !other_ready {
             self.signed_in = false;
-            self.emit(Event::Auth(AuthStatus::Failed(message.clone())));
+            self.emit(Event::Auth(match problem {
+                Some(problem) => AuthStatus::Refused(problem),
+                None => AuthStatus::Failed(message.clone()),
+            }));
+            if problem.is_some() {
+                return;
+            }
         }
         self.emit(Event::Error(message));
     }
@@ -2626,6 +3136,7 @@ impl Worker {
         }
         match source {
             ApiSource::Shared => {
+                self.emit(Event::SharedGrant(true));
                 if !self.signed_in {
                     self.signed_in = true;
                     self.emit(Event::Auth(AuthStatus::Connected {
@@ -2674,8 +3185,28 @@ impl Worker {
         }
     }
 
-    fn sign_in(&mut self) {
-        self.sign_in_source(ApiSource::Shared);
+    /// The sign-in screen's button: with the listener's own app, the only
+    /// way to sign in. Shared access takes no new sign-ins.
+    fn sign_in(&mut self, client_id: Option<String>) {
+        let client_id = client_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        if !client_id
+            .as_deref()
+            .is_some_and(crate::auth::looks_like_client_id)
+        {
+            self.emit(Event::Auth(AuthStatus::Refused(
+                SignInProblem::MalformedClientId,
+            )));
+            return;
+        }
+        if client_id != self.web_client_id {
+            // The same steps as choosing another app in Settings, which also
+            // starts its sign-in.
+            self.configure_personal_web_app(client_id);
+        } else {
+            self.sign_in_source(ApiSource::Personal);
+        }
     }
 
     fn sign_in_source(&mut self, source: ApiSource) {
@@ -2689,25 +3220,27 @@ impl Worker {
         if self.cancel_signin.is_some() {
             return;
         }
-        let grant = match source {
-            ApiSource::Shared => crate::auth::Grant::shared_web_api(),
-            ApiSource::Personal => {
-                let Some(client_id) = self.web_client_id.as_deref() else {
-                    return;
-                };
-                match crate::auth::Grant::personal_web_api(client_id) {
-                    Ok(grant) => grant,
-                    Err(error) => {
-                        self.emit(Event::Error(error.to_string()));
-                        return;
-                    }
-                }
+        // Signing in from the sign-in screen, rather than authorizing a
+        // personal app in Settings while already signed in.
+        let primary = !self.signed_in;
+        // A shared grant is only ever restored, never made.
+        if source == ApiSource::Shared {
+            return;
+        }
+        let Some(client_id) = self.web_client_id.as_deref() else {
+            return;
+        };
+        let grant = match crate::auth::Grant::personal_web_api(client_id) {
+            Ok(grant) => grant,
+            Err(error) => {
+                self.emit(Event::Error(error.to_string()));
+                return;
             }
         };
         let listener = match crate::auth::listen_for_redirect(grant.redirect_port) {
             Ok(listener) => listener,
             Err(error) => {
-                if source == ApiSource::Shared {
+                if primary {
                     self.emit(Event::Auth(AuthStatus::Failed(error.to_string())));
                 } else {
                     self.emit(Event::Error(error.to_string()));
@@ -2725,21 +3258,41 @@ impl Worker {
         self.cancel_signin = Some(cancel_tx);
         self.authorizing_source = Some(source);
         self.api.set_state(source, SessionState::Authorizing);
-        if source == ApiSource::Shared {
+        if primary {
             self.emit(Event::Auth(AuthStatus::WaitingForBrowser {
                 url: flow.url.clone(),
             }));
         }
         let browser_url = flow.url.clone();
-        tokio::task::spawn_blocking(move || {
-            if let Err(error) = crate::opener::open(&browser_url) {
-                log::warn!("unable to open a browser: {error}");
-            }
-        });
         let events = self.events.clone();
         let waker = self.waker.clone();
         let commands = self.commands.clone();
         tokio::spawn(async move {
+            // A Client ID Spotify never issued would stop on Spotify's page
+            // in the browser, which never tells the app. Ask first.
+            if crate::auth::client_known(&http, &grant.client_id).await == Some(false) {
+                if lease.current() {
+                    let _ = events.send(if primary {
+                        Event::Auth(AuthStatus::Refused(SignInProblem::UnknownClient))
+                    } else {
+                        Event::Error(
+                            "Spotify doesn't know this Client ID. Copy it again from your \
+                             app's page in Spotify's developer dashboard."
+                                .into(),
+                        )
+                    });
+                    waker.wake();
+                }
+                let _ = commands.send(Command::SignInEnded { source, attempt });
+                return;
+            }
+            if lease.current() {
+                tokio::task::spawn_blocking(move || {
+                    if let Err(error) = crate::opener::open(&browser_url) {
+                        log::warn!("unable to open a browser: {error}");
+                    }
+                });
+            }
             let result = async {
                 let code = crate::auth::wait_for_code_on_listener(listener, &flow.state, cancel_rx)
                     .await?;
@@ -2758,7 +3311,7 @@ impl Worker {
                     });
                 }
                 Err(error) => {
-                    if lease.current() && source == ApiSource::Shared {
+                    if lease.current() && primary {
                         let _ = events.send(Event::Auth(AuthStatus::SignedOut));
                     }
                     let message = error.to_string();
@@ -2814,12 +3367,17 @@ impl Worker {
         });
     }
 
+    /// Cancels in-flight account work and drops cached Home data on sign-out.
     fn sign_out(&mut self) {
         self.spotify_restore_started = true;
         self.cancel_search();
         self.signed_in = false;
         self.rootlist_pending = false;
+        self.made_for_you = Arc::new(crate::made_for_you::MadeForYou::new(self.http.clone()));
+        self.new_releases = Arc::new(crate::new_releases::NewReleases::new(self.http.clone()));
         self.session.send_modify(|generation| *generation += 1);
+        // Friends' names belong to the account that read them.
+        self.friend_names = Arc::default();
         self.connect = Arc::default();
         self.authorization_attempt += 1;
         if let Err(error) = self.credentials.revoke_spotify() {
@@ -2834,14 +3392,18 @@ impl Worker {
         self.resume = None;
         self.resume_verify = None;
         self.waiting_for_network = false;
+        self.cancel_engine_retry();
+        self.authorize_if_rejected = false;
         self.album_type_lookup.reset_session();
         self.audiobook_lookup.clear();
         self.playlist_header_lookup.clear_engine_work();
         self.radio_waiting.clear();
+        self.prerelease_waiting = None;
         self.carry_volume();
         if let Some(engine) = self.engine.take() {
             engine.shutdown();
         }
+        self.stop_kept_player();
         if let Some(cancel) = self.cancel_signin.take() {
             let _ = cancel.send(true);
         }
@@ -2884,6 +3446,10 @@ impl Worker {
                 }
                 EngineEvent::SessionEnded => {
                     let _ = commands.send(Command::Reconnect);
+                }
+                EngineEvent::AudioDevice { name, id } => {
+                    let _ = events.send(Event::AudioDeviceFound { name, id });
+                    waker.wake();
                 }
             }
         })
@@ -2930,6 +3496,9 @@ impl Worker {
         if !self.signed_in {
             return;
         }
+        // New audio settings take effect now, even when the replacement
+        // waits for a connection in flight.
+        self.stop_kept_player();
         if defer_engine_replace(self.engine_busy, &mut self.engine_restart_pending) {
             return;
         }
@@ -2950,7 +3519,7 @@ impl Worker {
             return;
         }
         if !self.network_reachable {
-            self.take_engine_for_resume();
+            self.take_engine_keeping_player();
             self.waiting_for_network = true;
             self.emit(Event::Playback(LocalPlayback::WaitingForNetwork));
             return;
@@ -2969,7 +3538,50 @@ impl Worker {
             "local playback session ended; reconnecting ({} of {RECONNECT_LIMIT} in ten minutes)",
             self.reconnects.len()
         );
-        self.replace_engine();
+        self.take_engine_keeping_player();
+        self.resume_engine();
+    }
+
+    /// Try the saved grant again after a backoff. Each failure in a row
+    /// waits longer, up to the last of `ENGINE_RETRY_DELAYS`.
+    fn schedule_engine_retry(&mut self) {
+        let delay = ENGINE_RETRY_DELAYS[self.engine_retries.min(ENGINE_RETRY_DELAYS.len() - 1)];
+        self.engine_retries += 1;
+        self.engine_retry_generation += 1;
+        let generation = self.engine_retry_generation;
+        log::info!("local playback connection failed; trying again in {delay}s");
+        let commands = self.commands.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+            let _ = commands.send(Command::RetryEngine { generation });
+        });
+    }
+
+    fn cancel_engine_retry(&mut self) {
+        self.engine_retries = 0;
+        self.engine_retry_generation += 1;
+    }
+
+    /// A scheduled retry is due. It runs quietly: the error already shown
+    /// stays until the engine is back, and network reachability still
+    /// decides whether to connect at all.
+    fn retry_engine(&mut self, generation: u64) {
+        if generation != self.engine_retry_generation
+            || !self.signed_in
+            || self.engine.is_some()
+            || self.engine_busy
+            || self.cancel_signin.is_some()
+            || self.playback_grant.is_none()
+        {
+            return;
+        }
+        if self.network_reachable {
+            self.engine_retry_quiet = true;
+        }
+        self.resume_engine();
+        if !self.engine_busy {
+            self.engine_retry_quiet = false;
+        }
     }
 
     /// Keeps the level being heard for the next engine, and lets what the
@@ -2986,6 +3598,7 @@ impl Worker {
     /// comes back at the level it was heard at, not at the level the app
     /// launched with.
     fn take_engine_for_resume(&mut self) {
+        self.stop_kept_player();
         self.resume_verify = None;
         self.album_type_lookup.requeue_active_for_new_engine();
         self.playlist_header_lookup.requeue_active_for_new_engine();
@@ -2996,10 +3609,101 @@ impl Worker {
         }
     }
 
+    /// Takes down an engine whose session dropped, keeping its player: the
+    /// song plays on from what it has fetched while the next engine
+    /// connects, and that engine takes the player over (#268).
+    fn take_engine_keeping_player(&mut self) {
+        self.resume_verify = None;
+        self.album_type_lookup.requeue_active_for_new_engine();
+        self.playlist_header_lookup.requeue_active_for_new_engine();
+        self.carry_volume();
+        if let Some(engine) = self.engine.take() {
+            // A replacement that dropped before picking the song up has no
+            // playback of its own to give: the first pickup stands.
+            if !engine.carrying() || self.resume.is_none() {
+                self.resume = engine.resume_point();
+            }
+            self.kept_player = Some(engine.keep_player());
+        }
+    }
+
+    /// A player command while there is no local engine.
+    fn player_without_engine(&mut self, command: PlayerCommand) {
+        // The effects can be set with nothing playing here; the next engine
+        // reads them itself, and a song carried through a reconnect keeps
+        // the new pace.
+        if let PlayerCommand::Rate(rate) = command {
+            if let Some(kept) = &self.kept_player {
+                kept.set_rate(rate);
+            }
+            return;
+        }
+        // While the session reconnects, the song it left pauses and plays
+        // on its own player (#268).
+        if command == PlayerCommand::Toggle
+            && self.kept_player.as_ref().is_some_and(KeptPlayer::toggle)
+        {
+            return;
+        }
+        if matches!(&command, PlayerCommand::Load(_)) {
+            // Something else chosen: the old song stops.
+            self.stop_kept_player();
+        }
+        self.emit(Event::Error(
+            "Local playback isn't set up on this computer yet".into(),
+        ))
+    }
+
+    /// Stops the song a dropped session left playing, when no engine is
+    /// going to pick it up.
+    fn stop_kept_player(&mut self) {
+        if let Some(player) = self.kept_player.take() {
+            player.stop();
+        }
+    }
+
+    /// Set up playback on this computer. A saved playback grant for this
+    /// account is tried first; the browser opens only when there is none or
+    /// Spotify rejects it (#818, #824).
+    fn authorize_playback(&mut self) {
+        if self.cancel_signin.is_some() {
+            return;
+        }
+        if self.engine_busy {
+            if std::mem::take(&mut self.engine_retry_quiet) {
+                // A background retry is already connecting: show it.
+                self.authorize_if_rejected = true;
+                self.emit(Event::Playback(LocalPlayback::Connecting));
+            }
+            return;
+        }
+        if self.premium == Some(false) {
+            self.emit(Event::Playback(LocalPlayback::Failed(
+                PREMIUM_NEEDED.into(),
+            )));
+            return;
+        }
+        let saved = self
+            .playback_grant
+            .as_ref()
+            .is_some_and(|grant| playback_account_matches(grant, self.api.account()));
+        if saved && self.signed_in && self.engine.is_none() {
+            self.cancel_engine_retry();
+            self.pending_playback_grant = None;
+            self.authorize_if_rejected = true;
+            self.resume_engine();
+            if self.engine_busy || self.waiting_for_network {
+                return;
+            }
+            self.authorize_if_rejected = false;
+        }
+        self.authorize_playback_in_browser();
+    }
+
     /// Start (or re-enter) the playback authorization in the browser. This is
     /// a distinct grant from the Web API sign-in: it uses Spotify's streaming
     /// client identity, the one librespot can play with.
-    fn authorize_playback(&mut self) {
+    fn authorize_playback_in_browser(&mut self) {
         let http = match self.http.client() {
             Ok(http) => http,
             Err(error) => {
@@ -3010,17 +3714,23 @@ impl Worker {
         if self.engine_busy || self.cancel_signin.is_some() {
             return;
         }
-        if self.premium == Some(false) {
-            self.emit(Event::Playback(LocalPlayback::Failed(
-                PREMIUM_NEEDED.into(),
-            )));
-            return;
-        }
+        let grant = crate::auth::Grant::playback();
+        // Reserve the callback port before touching the saved grant or
+        // opening the browser (#899, as #754 did for the Web API). A busy
+        // port must keep the saved grant and show the conflict, not send the
+        // approval to whichever app holds the port.
+        let listener = match crate::auth::listen_for_redirect(grant.redirect_port) {
+            Ok(listener) => listener,
+            Err(error) => {
+                self.emit(Event::Playback(LocalPlayback::Failed(error.to_string())));
+                return;
+            }
+        };
+        self.cancel_engine_retry();
         self.credentials.invalidate(CredentialSlot::Playback);
         self.authorization_attempt += 1;
         let attempt = self.authorization_attempt;
         let lease = self.credentials.lease(CredentialSlot::Playback);
-        let grant = crate::auth::Grant::playback();
         let flow = crate::auth::begin(grant.clone());
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.cancel_signin = Some(cancel_tx);
@@ -3037,8 +3747,8 @@ impl Worker {
         let commands = self.commands.clone();
         tokio::spawn(async move {
             let result = async {
-                let code =
-                    crate::auth::wait_for_code(grant.redirect_port, &flow.state, cancel_rx).await?;
+                let code = crate::auth::wait_for_code_on_listener(listener, &flow.state, cancel_rx)
+                    .await?;
                 crate::auth::exchange_code(&http, &grant, &code, &flow.verifier).await
             }
             .await;
@@ -3093,12 +3803,15 @@ impl Worker {
         self.engine_busy = true;
         self.engine_attempt = self.engine_attempt.wrapping_add(1);
         let attempt = self.engine_attempt;
-        self.emit(Event::Playback(LocalPlayback::Connecting));
+        if !self.engine_retry_quiet {
+            self.emit(Event::Playback(LocalPlayback::Connecting));
+        }
         let lease = self.credentials.lease(CredentialSlot::Playback);
         let config = self.engine_config.clone();
         let proxy = config.proxy.librespot_url();
         self.engine_proxy = proxy.clone();
         let notify = self.engine_notify();
+        let kept = self.kept_player.clone();
         let events = self.events.clone();
         let commands = self.commands.clone();
         let waker = self.waker.clone();
@@ -3123,6 +3836,7 @@ impl Worker {
                 credentials,
                 cache,
                 notify,
+                kept,
             ))
             .await;
             let outcome = match connect_outcome {
@@ -3172,7 +3886,12 @@ impl Worker {
         }
         if attempt != self.engine_attempt {
             if let Some(engine) = engine {
-                engine.shutdown();
+                // A newer attempt carries the same song on.
+                if engine.carrying() && self.kept_player.is_some() {
+                    engine.close_session();
+                } else {
+                    engine.shutdown();
+                }
             }
             return;
         }
@@ -3184,15 +3903,20 @@ impl Worker {
             // Keep `resume`: it belongs to the engine which was replaced,
             // not to this stale attempt. The newest config is already stored.
             self.resume_engine();
+            self.start_prerelease();
             return;
         }
+        let quiet = std::mem::take(&mut self.engine_retry_quiet);
+        let authorize_if_rejected = std::mem::take(&mut self.authorize_if_rejected);
         match engine {
             Some(engine) => {
                 self.waiting_for_network = false;
                 self.pending_playback_grant = None;
+                self.cancel_engine_retry();
                 if let Some(grant) = engine.credentials() {
                     if !playback_account_matches(&grant, self.api.account()) {
                         engine.shutdown();
+                        self.fail_waiting_prerelease("Playback was authorized for another Spotify account. Enable playback again with the signed-in account.");
                         self.emit(Event::Playback(LocalPlayback::Failed("Playback was authorized for another Spotify account. Enable playback again with the signed-in account.".into())));
                         return;
                     }
@@ -3207,6 +3931,8 @@ impl Worker {
                     });
                 }
                 let device_id = engine.device_id().to_string();
+                // The engine plays the kept song on now.
+                self.kept_player = None;
                 let engine = Arc::new(engine);
                 self.heard = Some(engine.heard());
                 if let Some(spec) = self.resume.take() {
@@ -3224,6 +3950,7 @@ impl Worker {
                 self.start_audiobook_lookup();
                 self.start_playlist_header_lookup();
                 self.start_radio();
+                self.start_prerelease();
             }
             None => {
                 if !self.network_reachable {
@@ -3237,19 +3964,44 @@ impl Worker {
                     if session_drops_exhausted(&mut self.reconnects, now) {
                         self.pending_playback_grant = None;
                         self.resume = None;
-                        self.emit(Event::Playback(LocalPlayback::Failed(
-                            "Local playback keeps dropping. Re-enable it from Settings.".into(),
-                        )));
+                        self.stop_kept_player();
+                        let message = "Local playback keeps dropping. Re-enable it from Settings.";
+                        self.fail_waiting_prerelease(message);
+                        self.emit(Event::Playback(LocalPlayback::Failed(message.into())));
                     } else {
                         self.reconnects.push(now);
                         self.resume_engine();
                     }
-                } else {
+                } else if authorize_if_rejected && is_rejected_grant(error.as_deref()) {
+                    // The user asked for playback and the saved grant no
+                    // longer works: ask Spotify for a new one.
                     self.waiting_for_network = false;
                     self.pending_playback_grant = None;
                     self.resume = None;
+                    self.stop_kept_player();
+                    self.authorize_playback_in_browser();
+                } else {
+                    self.waiting_for_network = false;
+                    self.pending_playback_grant = None;
                     let message = error.unwrap_or_else(|| "Local playback is unavailable".into());
-                    self.emit(Event::Playback(LocalPlayback::Failed(message)));
+                    self.fail_waiting_prerelease(&message);
+                    // A dropped or reset connection is not a rejected grant:
+                    // keep trying the saved one in the background (#818).
+                    let retrying = self.playback_grant.is_some()
+                        && !is_terminal_credential_error(Some(&message));
+                    if retrying {
+                        self.schedule_engine_retry();
+                    }
+                    // A song still playing out a dropped session carries on
+                    // through the retries, and the engine that connects
+                    // picks it up (#268). Anything else is forgotten.
+                    if !(retrying && self.kept_player.as_ref().is_some_and(KeptPlayer::has_song)) {
+                        self.resume = None;
+                        self.stop_kept_player();
+                    }
+                    if !quiet {
+                        self.emit(Event::Playback(LocalPlayback::Failed(message)));
+                    }
                 }
             }
         }
@@ -3267,6 +4019,7 @@ impl Worker {
             if let Some(engine) = self.engine.take() {
                 engine.shutdown();
             }
+            self.stop_kept_player();
             self.pending_playback_grant = None;
             let credential_stored = self.playback_grant.is_some();
             if credential_stored {
@@ -3286,26 +4039,46 @@ impl Worker {
 
     /// Browses for receivers Spotify's device list does not know about. The
     /// browse blocks, so it runs off the runtime's worker threads.
-    fn discover_receivers(&self) {
+    fn discover_receivers(&mut self) {
+        if self
+            .receiver_discovery
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return;
+        }
         let events = self.events.clone();
         let waker = self.waker.clone();
         let connect = Arc::clone(&self.connect);
-        tokio::task::spawn_blocking(move || {
-            match crate::zeroconf::discover(std::time::Duration::from_secs(3))
-                .and_then(crate::zeroconf::resolve_receivers)
-            {
-                Ok(receivers) => {
-                    connect.remember(&receivers);
-                    let _ = events.send(Event::Receivers(receivers));
-                    waker.wake();
-                }
-                Err(error) => log::debug!("no receivers found on the network: {error}"),
-            }
-        });
+        let updates = crate::zeroconf::ReceiverUpdates::default();
+        self.receiver_discovery =
+            Some(tokio::task::spawn_blocking(
+                move || match crate::zeroconf::discover_with_updates(
+                    std::time::Duration::from_secs(3),
+                    |receivers| {
+                        if updates.publish(receivers) {
+                            let _ = events.send(Event::ReceiversProgress(updates.clone()));
+                            waker.wake();
+                        }
+                    },
+                )
+                .map(|receivers| receiver_snapshot(receivers, crate::zeroconf::resolve_receivers))
+                {
+                    Ok(receivers) => {
+                        connect.remember(&receivers);
+                        let _ = events.send(Event::Receivers(receivers));
+                        waker.wake();
+                    }
+                    Err(error) => log::debug!("no receivers found on the network: {error}"),
+                },
+            ));
     }
 
     /// Sends the stored playback credential to a receiver so it can sign in.
     fn activate_receiver(&self, receiver: crate::zeroconf::Receiver) {
+        if receiver.cast {
+            return self.activate_cast(receiver);
+        }
         let events = self.events.clone();
         let waker = self.waker.clone();
         let credentials = self
@@ -3345,6 +4118,37 @@ impl Worker {
         });
     }
 
+    /// Starts Spotify on a Google Cast device and signs it in with a token
+    /// that this session obtains for the device's Spotify client.
+    fn activate_cast(&self, receiver: crate::zeroconf::Receiver) {
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        let session = self
+            .engine
+            .as_ref()
+            .map(|engine| engine.session().clone())
+            .filter(|session| same_account(&session.username(), self.api.account().as_ref()));
+        let lease = self.credentials.lease(CredentialSlot::Playback);
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let name = receiver.name.clone();
+            let result = (|| -> Result<(), String> {
+                let session = session.ok_or_else(|| "Enable playback on this computer first, so there is an account to hand over".to_string())?;
+                crate::cast::start(receiver.address, receiver.port, &name, |client, device| {
+                    let token =
+                        runtime.block_on(crate::cast::device_token(&session, client, device))?;
+                    if !lease.current() {
+                        anyhow::bail!("Sign-in changed before receiver activation.");
+                    }
+                    Ok(token)
+                })
+                .map_err(|error| format!("{error:#}"))
+            })();
+            let _ = events.send(Event::ReceiverActivated { name, result });
+            waker.wake();
+        });
+    }
+
     fn check_for_updates(&self, manual: bool, source: crate::updates::Source) {
         // A proxy still being restored or refused blocks the check, as it
         // blocks every other request.
@@ -3372,8 +4176,9 @@ impl Worker {
         let Some(engine) = &self.engine else {
             return;
         };
-        if engine.interrupted().is_some() {
-            // Playback resumed or another track started.
+        if engine.interrupted().is_some() && !engine.carrying() {
+            // Playback resumed or another track started. A song the player
+            // carried through the reconnect still needs picking up.
             return;
         }
         if attempts >= 3 {
@@ -3544,7 +4349,7 @@ impl Worker {
             return;
         }
         if let Some(header) = header {
-            self.emit(Event::PlaylistHeader(header));
+            self.emit(Event::PlaylistHeader(Box::new(header)));
         }
         self.start_playlist_header_lookup();
     }
@@ -3586,6 +4391,152 @@ impl Worker {
                 });
             });
         }
+    }
+
+    fn remove_playlist_rows(&self, playlist_id: String, rows: Vec<session_reads::RemovedRow>) {
+        let answer = |id: String, result: Result<Option<String>, String>| {
+            Event::Api(Box::new(ApiResponse::PlaylistItemsChanged {
+                id,
+                message: "Removed from playlist".to_string(),
+                result: result.map_err(|message| ApiError::Status { status: 0, message }),
+            }))
+        };
+        // The Web API would remove every copy, so without the session the
+        // change is refused rather than made bigger than asked.
+        let Some(engine) = self.engine.clone().filter(|_| self.signed_in) else {
+            self.emit(answer(
+                playlist_id,
+                Err(
+                    "Removing one copy of a repeated song needs local playback. Try again when connected."
+                        .into(),
+                ),
+            ));
+            return;
+        };
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        let mut cancelled = self.session.subscribe();
+        tokio::spawn(async move {
+            let result = tokio::select! {
+                biased;
+                _ = cancelled.changed() => return,
+                result = tokio::time::timeout(
+                    RADIO_TIMEOUT,
+                    session_reads::remove_playlist_rows(engine.session(), &playlist_id, &rows),
+                ) => match result {
+                    Ok(result) => result.map_err(|error| format!("{error:#}")),
+                    Err(_) => Err("Spotify took too long to answer. Check the playlist and try again.".into()),
+                },
+            };
+            let _ = events.send(answer(playlist_id, result));
+            waker.wake();
+        });
+    }
+
+    fn set_prerelease_saved(&self, uri: String, saved: bool, generation: u64) {
+        let session_generation = *self.session.borrow();
+        let Some(engine) = self.engine.clone().filter(|_| self.signed_in) else {
+            self.emit(Event::PrereleaseSaved {
+                uri,
+                saved,
+                generation,
+                result: Err("Local playback is unavailable. Try again when connected.".into()),
+            });
+            return;
+        };
+        let http = crate::http::build_collection_client(&self.engine_config.proxy);
+        let commands = self.commands.clone();
+        let mut cancelled = self.session.subscribe();
+        tokio::spawn(async move {
+            let result = match http {
+                Err(error) => Err(error),
+                Ok(http) => tokio::select! {
+                biased;
+                _ = cancelled.changed() => return,
+                result = tokio::time::timeout(RADIO_TIMEOUT, session_reads::set_prerelease_saved(engine.session(), &http, &uri, saved)) => match result {
+                    Ok(result) => result.map_err(|error| format!("{error:#}")),
+                    Err(_) => Err("Spotify took too long to confirm pre-save. Open the link again to check.".into()),
+                }
+                },
+            };
+            let _ = commands.send(Command::PrereleaseSaved {
+                session_generation,
+                uri,
+                saved,
+                generation,
+                result,
+            });
+        });
+    }
+
+    fn fail_waiting_prerelease(&mut self, message: &str) {
+        if let Some((uri, generation)) = self.prerelease_waiting.take() {
+            self.emit(Event::Prerelease {
+                uri,
+                generation,
+                result: Err(message.into()),
+            });
+        }
+    }
+
+    fn start_prerelease(&mut self) {
+        if self.prerelease_waiting.is_none() {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            if self.restore_pending[CredentialSlot::Playback.index()] || self.engine_busy {
+                return;
+            }
+            let has_credentials =
+                self.playback_grant.is_some() || self.pending_playback_grant.is_some();
+            if has_credentials {
+                self.resume_engine();
+            }
+            if !self.engine_busy && (!self.waiting_for_network || !has_credentials) {
+                self.fail_waiting_prerelease(
+                    "Upcoming albums need playback authorization for this account in Settings.",
+                );
+            }
+            return;
+        };
+        let Some((uri, generation)) = self.prerelease_waiting.take() else {
+            return;
+        };
+        let session_generation = *self.session.borrow();
+        let mut cancelled = self.session.subscribe();
+        let commands = self.commands.clone();
+        let web = self.api.prerelease_http_client();
+        tokio::spawn(async move {
+            let Some(web) = web else {
+                let _ = commands.send(Command::PrereleaseResolved {
+                    session_generation,
+                    uri,
+                    generation,
+                    result: Err("Sign in before opening an upcoming album.".into()),
+                });
+                return;
+            };
+            let started = Instant::now();
+            let result = tokio::select! {
+                biased;
+                _ = cancelled.changed() => return,
+                result = tokio::time::timeout(RADIO_TIMEOUT, session_reads::prerelease(engine.session(), &web, &uri)) => match result {
+                    Ok(result) => result.map_err(|error| format!("{error:#}")),
+                    Err(_) => Err("Spotify took too long to load this upcoming album. Try the link again.".into()),
+                }
+            };
+            log::info!(
+                "Prerelease source=session success={} elapsed_ms={}",
+                result.is_ok(),
+                started.elapsed().as_millis()
+            );
+            let _ = commands.send(Command::PrereleaseResolved {
+                session_generation,
+                uri,
+                generation,
+                result: result.map(Box::new),
+            });
+        });
     }
 
     fn start_album_type_lookup(&mut self) {
@@ -3631,10 +4582,21 @@ impl Worker {
         let cache_dir = self.dirs.lyrics_cache_dir();
         let engine = self.engine.clone();
         tokio::spawn(async move {
-            // Spotify's own words go first: they follow the recording
-            // exactly. Everything else, a signed-out session included,
-            // falls back to LRCLIB.
-            let result = match spotify_lyrics(engine, &request.uri, &cache_dir).await {
+            // A local file's own words go first, then Spotify's: they
+            // follow the recording exactly. Everything else, a signed-out
+            // session included, falls back to LRCLIB.
+            let own = match request.local_file {
+                Some(file) => tokio::task::spawn_blocking(move || crate::local_tags::lyrics(&file))
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
+            let exact = match own {
+                Some(found) => Some(found),
+                None => spotify_lyrics(engine, &request.uri, &cache_dir).await,
+            };
+            let result = match exact {
                 Some(found) => Ok(Some(found)),
                 None => match http {
                     Ok(http) => crate::lyrics::fetch(&http, &cache_dir, &request.query)
@@ -3705,10 +4667,85 @@ impl Worker {
         let waker = self.waker.clone();
         tokio::spawn(async move {
             for id in ids {
-                let name = session_reads::user_display_name(engine.session(), &id).await;
-                let _ = events.send(Event::UserName { id, name });
+                let profile = session_reads::user_profile(engine.session(), &id).await;
+                let (name, image) = match profile {
+                    Some(profile) => (profile.name, profile.image_url),
+                    None => (None, None),
+                };
+                let _ = events.send(Event::UserName { id, name, image });
                 waker.wake();
             }
+        });
+    }
+
+    /// Ask Spotify how often each song of an album or each of an artist's
+    /// popular songs was played. It needs the playback session and a
+    /// verified Web API grant, as upcoming album pages do; without them the
+    /// lists simply show no counts.
+    fn fetch_play_counts(&self, uri: String) {
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        let send = move |uri, result| {
+            let _ = events.send(Event::PlayCounts { uri, result });
+            waker.wake();
+        };
+        let Some(engine) = self.engine.clone() else {
+            return send(uri, Err("Play counts need playback enabled.".into()));
+        };
+        let Some(web) = self.api.prerelease_http_client() else {
+            return send(uri, Err("Play counts need a signed-in account.".into()));
+        };
+        let mut cancelled = self.session.subscribe();
+        tokio::spawn(async move {
+            let read = tokio::time::timeout(
+                Duration::from_secs(15),
+                session_reads::play_counts(engine.session(), &web, &uri),
+            );
+            let result = tokio::select! {
+                biased;
+                // A later visit asks again.
+                _ = cancelled.changed() => Err("The playback session ended.".to_string()),
+                result = read => result
+                    .map_err(|_| "Spotify took too long to answer.".to_string())
+                    .and_then(|result| result.map_err(|error| format!("{error:#}"))),
+            };
+            if let Err(error) = &result {
+                log::debug!("Play counts unavailable: {error}");
+            }
+            send(uri, result);
+        });
+    }
+
+    /// Ask the streaming session what friends are listening to. Without one
+    /// there is nobody to ask, which the panel says.
+    /// A read still running when the session ends is dropped, so nothing
+    /// from the last account reaches the next.
+    fn fetch_friend_activity(&self, generation: u64) {
+        let events = self.events.clone();
+        let waker = self.waker.clone();
+        let send = move |result| {
+            let _ = events.send(Event::FriendActivity { generation, result });
+            waker.wake();
+        };
+        let Some(engine) = self.engine.clone() else {
+            send(Err("Listening activity needs playback enabled.".into()));
+            return;
+        };
+        let names = self.friend_names.clone();
+        let mut cancelled = self.session.subscribe();
+        tokio::spawn(async move {
+            let read = tokio::time::timeout(
+                Duration::from_secs(15),
+                session_reads::friend_activity(engine.session(), &names),
+            );
+            let result = tokio::select! {
+                biased;
+                _ = cancelled.changed() => return,
+                result = read => result,
+            }
+            .map_err(|_| "Spotify took too long to answer.".to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            send(result);
         });
     }
 
@@ -3725,7 +4762,9 @@ impl Worker {
         if query.is_empty() {
             return;
         }
-        let split = self.api.personal_ready();
+        // Splitting moves playlists to shared access; without it, one request
+        // to the personal app asks for everything.
+        let split = self.api.personal_ready() && self.api.has_shared();
         self.emit(Event::Api(Box::new(ApiResponse::SearchStarted {
             query: query.clone(),
             serial,
@@ -3749,6 +4788,13 @@ impl Worker {
     /// Cancel requests on sign-out and report completion under their original generation.
     fn dispatch(&self, request: ApiRequest) -> tokio::task::AbortHandle {
         let api = Arc::clone(&self.api);
+        let made_for_you = Arc::clone(&self.made_for_you);
+        let new_releases = Arc::clone(&self.new_releases);
+        let home_account = if matches!(request, ApiRequest::MadeForYou { .. }) {
+            api.account()
+        } else {
+            None
+        };
         let connect = Arc::clone(&self.connect);
         let shared_lease = self.credentials.lease(CredentialSlot::Shared);
         let personal_lease = self.credentials.lease(CredentialSlot::Personal);
@@ -3761,13 +4807,14 @@ impl Worker {
             let (response, expired) = tokio::select! {
                 _ = session.changed() => return,
                 result = async {
-                    handle(&api, &connect, engine.as_deref(), &background_session, request).await
+                    handle(&api, &made_for_you, &new_releases, &connect, engine.as_deref(), &background_session, request).await
                 } => result,
             };
             // Apply completion on the command loop. A late response cannot
             // clear or repopulate a session created after sign-out.
             let _ = commands.send(Command::ApiFinished {
                 generation,
+                home_account,
                 response: Box::new(response),
                 expired,
                 shared_lease,
@@ -3783,12 +4830,15 @@ impl Worker {
         let waker = self.waker.clone();
         tokio::spawn(async move {
             if let Ok(bytes) = art.fetch(&url).await {
-                let color = tokio::task::spawn_blocking(move || accent_color(&bytes))
+                let palette = tokio::task::spawn_blocking(move || art_palette(&bytes))
                     .await
-                    .ok()
-                    .flatten();
-                if let Some(color) = color {
-                    let _ = events.send(Event::Accent { url, color });
+                    .unwrap_or_default();
+                if let Some(&color) = palette.first() {
+                    let _ = events.send(Event::Accent {
+                        url,
+                        color,
+                        palette,
+                    });
                     waker.wake();
                 }
             }
@@ -3808,6 +4858,17 @@ fn friendly_connect_error(error: &anyhow::Error) -> String {
     } else {
         text
     }
+}
+
+/// Spotify refused the playback grant itself, as opposed to the connection
+/// failing on the way.
+fn is_rejected_grant(error: Option<&str>) -> bool {
+    error.is_some_and(|msg| {
+        let lower = msg.to_lowercase();
+        lower.contains("badcredentials")
+            || lower.contains("bad credentials")
+            || lower.contains("rejected the saved sign-in")
+    })
 }
 
 fn is_terminal_credential_error(error: Option<&str>) -> bool {
@@ -3851,8 +4912,13 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         }
         ApiRequest::MyPlaylists { .. } => Operation::PlaylistLibrary,
         ApiRequest::CreatePlaylist { .. } => Operation::PlaylistCreation,
-        ApiRequest::Discover { .. } | ApiRequest::SearchPlaylists { .. } => {
+        ApiRequest::MadeForYou { .. } | ApiRequest::SearchPlaylists { .. } => {
             Operation::PlaylistSearch
+        }
+        ApiRequest::NewReleases { .. } => Operation::UserData,
+        ApiRequest::NewReleaseTracks { .. } => Operation::Catalog,
+        ApiRequest::HiddenSongs { .. } | ApiRequest::SetHiddenInPlaylist { .. } => {
+            Operation::UserData
         }
         ApiRequest::SearchCatalogue { .. } => Operation::CatalogSearch,
         ApiRequest::Search { .. } => Operation::PlaylistSearch,
@@ -3863,9 +4929,6 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         | ApiRequest::PlaylistSample { id, .. }
         | ApiRequest::CheckPlaylistDuplicates {
             playlist_id: id, ..
-        }
-        | ApiRequest::FindPlaylistDuplicates {
-            playlist_id: id, ..
         } => Operation::PlaylistItems(api.playlist_access(id)),
         ApiRequest::UploadPlaylistCover { id, .. }
         | ApiRequest::UpdatePlaylist { id, .. }
@@ -3874,14 +4937,12 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         }
         ApiRequest::AddToPlaylist { playlist_id, .. }
         | ApiRequest::RemoveFromPlaylist { playlist_id, .. }
-        | ApiRequest::RemovePlaylistDuplicates { playlist_id, .. }
         | ApiRequest::ReorderPlaylist { playlist_id, .. } => {
             Operation::PlaylistMutation(api.playlist_access(playlist_id))
         }
         ApiRequest::ArtistTopTracks { .. } => Operation::ArtistTopTracks,
-        ApiRequest::Recommendations { .. } | ApiRequest::RelatedArtists { .. } => {
-            Operation::UnsupportedDevelopmentMode
-        }
+        ApiRequest::RelatedArtists { .. } => Operation::RelatedArtists,
+        ApiRequest::Recommendations { .. } => Operation::UnsupportedDevelopmentMode,
         ApiRequest::Artist { .. }
         | ApiRequest::ArtistAlbums { .. }
         | ApiRequest::Album { .. }
@@ -3895,12 +4956,16 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
     }
 }
 
+/// Records returned playlist ownership for later metadata and item routing.
 fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
     match response {
-        ApiResponse::Discover {
-            result: Ok(playlists),
-            ..
-        } => api.observe_playlists(playlists),
+        ApiResponse::MadeForYou {
+            result, top_mixes, ..
+        } => {
+            for playlists in [result, top_mixes].into_iter().flatten() {
+                api.observe_playlists(playlists);
+            }
+        }
         ApiResponse::MyPlaylists {
             result: Ok(page), ..
         } => api.observe_playlists(&page.items),
@@ -3944,11 +5009,6 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
             result: Err(error),
             ..
         }
-        | ApiResponse::PlaylistDuplicatesFound {
-            playlist_id: id,
-            result: Err(error),
-            ..
-        }
         | ApiResponse::PlaylistFollowChanged {
             id,
             result: Err(error),
@@ -3960,19 +5020,363 @@ fn observe_playlists(api: &ApiGateway, response: &ApiResponse) {
     }
 }
 
-/// Try a same-account session read, then the authorized Web API with its own background budget.
+const SHARED_MADE_FOR_YOU_TERMS: [&str; 4] =
+    ["Discover Weekly", "Release Radar", "Daily Mix", "daylist"];
+const UNSUPPORTED_DJ_URI: &str = "spotify:playlist:37i9dQZF1EYkqdzj48dyYq";
+
+/// Search is an approximation, used only when Spotify's personalized Home
+/// section cannot be read.
+/// Releases from Spotify's own new-releases feed over the playback session,
+/// or, when that cannot answer, from the Web API's followed artists.
+async fn read_new_releases(
+    api: &ApiGateway,
+    new_releases: &crate::new_releases::NewReleases,
+    engine: Option<&Engine>,
+    background_session: &tokio::sync::Semaphore,
+) -> ApiResult<Vec<Album>> {
+    if let Some(engine) = engine {
+        let _permit = background_session.acquire().await.ok();
+        match new_releases.feed(engine.session()).await {
+            Ok(albums) => {
+                log::debug!("Spotify route operation=NewReleases source=session");
+                return Ok(albums);
+            }
+            Err(error) => {
+                log::warn!("New releases session read failed; asking the Web API: {error}");
+            }
+        }
+    }
+    let account = api.account().map(|account| account.as_str().to_owned());
+    if let Some(account) = &account
+        && let Some(albums) = new_releases.cached_fallback(account).await
+    {
+        return Ok(albums);
+    }
+    let albums = followed_artist_releases(api).await?;
+    if let Some(account) = &account {
+        new_releases.keep_fallback(account, &albums).await;
+    }
+    log::debug!("Spotify route operation=NewReleases source=web-api");
+    Ok(albums)
+}
+
+/// The latest albums and singles of the first followed artists, merged.
+async fn followed_artist_releases(api: &ApiGateway) -> ApiResult<Vec<Album>> {
+    let client = api.client_for(Operation::UserData).await?;
+    let mut artists = Vec::new();
+    let mut after: Option<String> = None;
+    while artists.len() < crate::new_releases::FALLBACK_ARTISTS {
+        let page = client.followed_artists(after.as_deref(), 50).await?;
+        let next = page.cursors.and_then(|cursors| cursors.after);
+        let empty = page.items.is_empty();
+        artists.extend(page.items);
+        match next {
+            Some(next) if !empty => after = Some(next),
+            _ => break,
+        }
+    }
+    artists.truncate(crate::new_releases::FALLBACK_ARTISTS);
+    let catalog = api.client_for(Operation::Catalog).await?;
+    let _permit = catalog.background_permit().await;
+    let mut reads = tokio::task::JoinSet::new();
+    for artist in artists {
+        let catalog = Arc::clone(&catalog);
+        reads.spawn(async move {
+            catalog
+                .artist_albums(&artist.id, "album,single", 0, NEW_RELEASES_PER_ARTIST)
+                .await
+        });
+    }
+    let mut pages = Vec::new();
+    let mut failure = None;
+    while let Some(joined) = reads.join_next().await {
+        let Ok(result) = joined else {
+            continue;
+        };
+        match result {
+            Ok(page) => pages.push(page.items),
+            // One artist gone answers alone; a rate limit, quota or lost
+            // sign-in would answer the same for every artist left.
+            Err(error) => {
+                let stop = !matches!(error, ApiError::Status { .. } | ApiError::Decode(_));
+                failure.get_or_insert(error);
+                if stop {
+                    reads.abort_all();
+                    break;
+                }
+            }
+        }
+    }
+    match failure {
+        Some(error) if pages.is_empty() => Err(error),
+        _ => Ok(crate::new_releases::merge_artist_releases(pages)),
+    }
+}
+
+/// The songs of the releases on the New releases page, over the playback
+/// session when it can answer, otherwise album by album from the Web API.
+async fn read_new_release_tracks(
+    api: &ApiGateway,
+    engine: Option<&Engine>,
+    background_session: &tokio::sync::Semaphore,
+    albums: &[Album],
+) -> ApiResult<Vec<Track>> {
+    if let Some(engine) = engine {
+        let _permit = background_session.acquire().await.ok();
+        match session_reads::album_tracks(engine.session(), albums).await {
+            Ok(tracks) => return Ok(tracks),
+            Err(session_reads::Failure::Definitive(error)) => return Err(error),
+            Err(session_reads::Failure::Retry(error)) => {
+                log::debug!("new release songs session read failed: {error}; asking the Web API");
+            }
+        }
+    }
+    let catalog = api.client_for(Operation::Catalog).await?;
+    let _permit = catalog.background_permit().await;
+    let mut reads = tokio::task::JoinSet::new();
+    for (index, album) in albums.iter().cloned().enumerate() {
+        let catalog = Arc::clone(&catalog);
+        reads.spawn(async move {
+            let result = catalog.album_tracks(&album.id, 0, 50).await;
+            (index, album, result)
+        });
+    }
+    let mut answers = Vec::new();
+    let mut failure = None;
+    while let Some(joined) = reads.join_next().await {
+        let Ok((index, album, result)) = joined else {
+            continue;
+        };
+        match result {
+            Ok(page) => answers.push((index, album, page.items)),
+            Err(error) => {
+                let stop = !matches!(error, ApiError::Status { .. } | ApiError::Decode(_));
+                failure.get_or_insert(error);
+                if stop {
+                    reads.abort_all();
+                    break;
+                }
+            }
+        }
+    }
+    answers.sort_by_key(|(index, ..)| *index);
+    let tracks: Vec<Track> = answers
+        .into_iter()
+        .flat_map(|(_, album, tracks)| {
+            tracks.into_iter().map(move |mut track| {
+                track.album = Some(album.clone());
+                track
+            })
+        })
+        .collect();
+    match failure {
+        Some(error) if tracks.is_empty() => Err(error),
+        _ => Ok(tracks),
+    }
+}
+
+/// The playback session of the signed-in account, for what only it can do.
+fn playback_session<'a>(
+    api: &ApiGateway,
+    engine: Option<&'a Engine>,
+) -> ApiResult<&'a librespot_core::session::Session> {
+    engine
+        .filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
+        .map(Engine::session)
+        .ok_or_else(|| ApiError::Status {
+            status: 503,
+            message: "Hiding songs needs playback on this computer.".into(),
+        })
+}
+
+async fn shared_made_for_you(api: &ApiGateway) -> ApiResult<Vec<Playlist>> {
+    let client = api.client_for(Operation::PlaylistSearch).await?;
+    let _background_permit = client.background_permit().await;
+    let mut playlists = Vec::new();
+    let mut seen = HashSet::new();
+    for term in SHARED_MADE_FOR_YOU_TERMS {
+        let results = client.search(term, &["playlist"]).await?;
+        let mut matching: Vec<_> = results
+            .playlists
+            .into_iter()
+            .flat_map(|page| page.items)
+            .filter(|playlist| shared_made_for_you_match(playlist, term))
+            .filter(|playlist| seen.insert(playlist.name.to_ascii_lowercase()))
+            .take(6)
+            .collect();
+        playlists.append(&mut matching);
+    }
+    log::debug!("Spotify route operation=MadeForYou source=shared-fallback");
+    Ok(playlists)
+}
+
+/// Accepts only Spotify-owned fallback matches with supported playlist URIs.
+fn shared_made_for_you_match(playlist: &Playlist, term: &str) -> bool {
+    let name = playlist.name.trim();
+    let matches_name = name.eq_ignore_ascii_case(term)
+        || (term == "Daily Mix"
+            && name.strip_prefix("Daily Mix ").is_some_and(|number| {
+                !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit())
+            }));
+    matches_name
+        && playlist.uri != UNSUPPORTED_DJ_URI
+        && playlist.owner.id.as_deref() == Some("spotify")
+}
+
+/// Searches through the shared app only when the playback-session read fails.
+async fn with_shared_made_for_you_fallback<F, Fut>(
+    session_result: ApiResult<Vec<Playlist>>,
+    fallback: F,
+) -> (ApiResult<Vec<Playlist>>, bool, Vec<ApiSource>)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ApiResult<Vec<Playlist>>>,
+{
+    match session_result {
+        Ok(playlists) => (Ok(playlists), true, Vec::new()),
+        Err(error) => {
+            let mut expired = Vec::new();
+            if let ApiError::SignInExpired { api_source } = &error {
+                expired.push(*api_source);
+            }
+            log::warn!("Made for you session read failed; trying shared search fallback: {error}");
+            let result = fallback().await;
+            if let Err(ApiError::SignInExpired { api_source }) = &result
+                && !expired.contains(api_source)
+            {
+                expired.push(*api_source);
+            }
+            (result, false, expired)
+        }
+    }
+}
+
+/// Tries the session Home route before the shared fallback and routes other API work.
 async fn handle(
     api: &ApiGateway,
+    made_for_you: &crate::made_for_you::MadeForYou,
+    new_releases: &crate::new_releases::NewReleases,
     connect: &crate::sonos::Controller,
     engine: Option<&Engine>,
     background_session: &tokio::sync::Semaphore,
     request: ApiRequest,
-) -> (ApiResponse, Option<ApiSource>) {
+) -> (ApiResponse, Vec<ApiSource>) {
+    if let ApiRequest::MadeForYou { generation, force } = request {
+        let shelves = match engine
+            .filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
+        {
+            Some(engine) => {
+                let _background_permit = background_session.acquire().await.ok();
+                let playback_account = engine.session().username();
+                made_for_you
+                    .load(engine.session(), force, || {
+                        api.home_context_token(&playback_account)
+                    })
+                    .await
+            }
+            None => Err(ApiError::Status {
+                status: 503,
+                message: "The playback session is unavailable for Made for you.".into(),
+            }),
+        };
+        let (session_result, top_mixes) = match shelves {
+            Ok(shelves) => {
+                if let Err(error) = &shelves.top_mixes {
+                    log::warn!("Your top mixes session read failed: {error}");
+                }
+                (Ok(shelves.made_for_you), shelves.top_mixes)
+            }
+            Err(error) => (Err(error.clone()), Err(error)),
+        };
+        let (result, personalized, expired) =
+            with_shared_made_for_you_fallback(session_result, || async {
+                shared_made_for_you(api).await
+            })
+            .await;
+        return (
+            ApiResponse::MadeForYou {
+                generation,
+                personalized,
+                result,
+                top_mixes,
+            },
+            expired,
+        );
+    }
+    let session_engine =
+        engine.filter(|engine| same_account(&engine.session().username(), api.account().as_ref()));
+    if let ApiRequest::NewReleases { generation } = request {
+        let mut expired = Vec::new();
+        let result =
+            match read_new_releases(api, new_releases, session_engine, background_session).await {
+                Err(ApiError::SignInExpired { api_source }) => {
+                    expired.push(api_source);
+                    Err(ApiError::SignInExpired { api_source })
+                }
+                result => result,
+            };
+        return (ApiResponse::NewReleases { generation, result }, expired);
+    }
+    if let ApiRequest::NewReleaseTracks { albums, generation } = request {
+        let mut expired = Vec::new();
+        let result =
+            match read_new_release_tracks(api, session_engine, background_session, &albums).await {
+                Err(ApiError::SignInExpired { api_source }) => {
+                    expired.push(api_source);
+                    Err(ApiError::SignInExpired { api_source })
+                }
+                result => result,
+            };
+        return (
+            ApiResponse::NewReleaseTracks { generation, result },
+            expired,
+        );
+    }
+    if let ApiRequest::HiddenSongs { generation } = request {
+        let result = match playback_session(api, engine) {
+            Ok(session) => {
+                let _permit = background_session.acquire().await.ok();
+                session_reads::hidden_songs(session)
+                    .await
+                    .map_err(|error| ApiError::Network(format!("{error:#}")))
+            }
+            Err(error) => Err(error),
+        };
+        return (ApiResponse::HiddenSongs { generation, result }, Vec::new());
+    }
+    if let ApiRequest::SetHiddenInPlaylist {
+        playlist_uri,
+        track_uri,
+        hidden,
+    } = request
+    {
+        let result = match playback_session(api, engine) {
+            Ok(session) => session_reads::set_hidden(
+                session,
+                &playlist_uri,
+                &track_uri,
+                hidden,
+                jiff::Timestamp::now().as_second(),
+            )
+            .await
+            .map_err(|error| ApiError::Network(format!("{error:#}"))),
+            Err(error) => Err(error),
+        };
+        return (
+            ApiResponse::HiddenInPlaylistSet {
+                playlist_uri,
+                track_uri,
+                hidden,
+                result,
+            },
+            Vec::new(),
+        );
+    }
     let operation = operation_for(api, &request);
     // A session whose long-lived connection has dropped still answers over
     // its HTTP client, so the engine's presence is the only liveness test;
     // a read the session truly cannot make falls back to the Web API below.
-    if api.session_serves(operation)
+    if (api.session_serves(operation) || library_over_session(api, operation).await)
         && let Some(engine) = engine
             .filter(|engine| same_account(&engine.session().username(), api.account().as_ref()))
     {
@@ -3982,12 +5386,13 @@ async fn handle(
             } else {
                 None
             };
-            over_session(engine, &request).await
+            let web = api.prerelease_http_client();
+            over_session(engine, web.as_deref(), &request).await
         };
         if let Some(response) = response {
             log::debug!("Spotify route operation={operation:?} source=session");
             observe_playlists(api, &response);
-            return (response, None);
+            return (response, Vec::new());
         }
     }
     if let Some(engine) =
@@ -3995,7 +5400,7 @@ async fn handle(
         && let Some(response) = over_connect(engine, connect, &request).await
     {
         log::debug!("Spotify route operation={operation:?} source=connect");
-        return (response, None);
+        return (response, Vec::new());
     }
     let selected = api.client_for(operation).await;
     let _background_permit = if request.background() {
@@ -4043,11 +5448,17 @@ async fn handle(
             result: routed!(recently_played(limit, None, before.as_deref())),
         },
         ApiRequest::TopTracks {
+            period,
             offset,
             full,
             generation,
         } => ApiResponse::TopTracks {
-            result: routed!(top_tracks("short_term", if full { 50 } else { 20 }, offset)),
+            result: routed!(top_tracks(
+                period.as_spotify(),
+                if full { 50 } else { 20 },
+                offset
+            )),
+            period,
             offset,
             full,
             generation,
@@ -4064,15 +5475,11 @@ async fn handle(
             generation,
             result: routed!(recommendations(&seed_tracks, &seed_artists, 20)),
         },
-        ApiRequest::Discover { term, generation } => {
-            let result = routed!(search(&term, &["playlist"]))
-                .map(|results| results.playlists.map(|page| page.items).unwrap_or_default());
-            ApiResponse::Discover {
-                term,
-                generation,
-                result,
-            }
-        }
+        ApiRequest::MadeForYou { .. }
+        | ApiRequest::NewReleases { .. }
+        | ApiRequest::NewReleaseTracks { .. }
+        | ApiRequest::HiddenSongs { .. }
+        | ApiRequest::SetHiddenInPlaylist { .. } => unreachable!("handled before Web API routing"),
         ApiRequest::MyPlaylists { offset, generation } => ApiResponse::MyPlaylists {
             offset,
             generation,
@@ -4138,36 +5545,16 @@ async fn handle(
             playlist_name,
             items,
             position,
-        } => ApiResponse::PlaylistDuplicatesChecked {
-            result: routed!(playlist_duplicates(&playlist_id, &items)),
-            playlist_id,
-            playlist_name,
-            items,
-            position,
-        },
-        ApiRequest::FindPlaylistDuplicates {
-            playlist_id,
-            playlist_name,
-        } => ApiResponse::PlaylistDuplicatesFound {
-            result: routed!(all_playlist_items(&playlist_id)),
-            playlist_id,
-            playlist_name,
-        },
-        ApiRequest::RemovePlaylistDuplicates {
-            playlist_id,
-            uris,
-            readd,
-            snapshot_id,
-        } => ApiResponse::PlaylistItemsChanged {
-            result: routed!(remove_playlist_duplicates(
-                &playlist_id,
-                &uris,
-                &readd,
-                snapshot_id.as_deref()
-            )),
-            id: playlist_id,
-            message: "Removed duplicates".to_string(),
-        },
+        } => {
+            let uris: Vec<String> = items.iter().map(|item| item.uri().to_string()).collect();
+            ApiResponse::PlaylistDuplicatesChecked {
+                result: routed!(playlist_duplicates(&playlist_id, &uris)),
+                playlist_id,
+                playlist_name,
+                items,
+                position,
+            }
+        }
         ApiRequest::AddToPlaylist {
             playlist_id,
             playlist_name,
@@ -4355,23 +5742,49 @@ async fn handle(
             shows: asked,
             generation,
         } => {
-            let mut shows = Vec::new();
-            let mut failure = None;
-            for show in asked {
-                match routed!(show_episodes(&show.id, 0, HOME_EPISODES_PER_SHOW)) {
-                    Ok(page) => shows.push((show, page.items)),
+            let mut answers = Vec::new();
+            let mut failure = selected.as_ref().err().cloned();
+            let mut reads = tokio::task::JoinSet::new();
+            if let Ok(client) = &selected {
+                for (index, show) in asked.into_iter().enumerate() {
+                    let client = Arc::clone(client);
+                    reads.spawn(async move {
+                        let result = client
+                            .show_episodes(&show.id, 0, HOME_EPISODES_PER_SHOW)
+                            .await;
+                        (index, show, result)
+                    });
+                }
+            }
+            while let Some(joined) = reads.join_next().await {
+                // A read that panicked has already reported it; the others
+                // still answer for their own shows.
+                let Ok((index, show, result)) = joined else {
+                    continue;
+                };
+                match result {
+                    Ok(page) => answers.push((index, show, page.items)),
                     // A show that is gone answers on its own; a rate limit,
                     // an exhausted quota or a lost sign-in would answer the
-                    // same for every show still to come, so stop asking.
+                    // same for every show still to come, so stop the rest.
                     Err(error) => {
+                        if let ApiError::SignInExpired { api_source } = &error {
+                            expired.set(Some(*api_source));
+                        }
                         let stop = !matches!(error, ApiError::Status { .. } | ApiError::Decode(_));
                         failure.get_or_insert(error);
                         if stop {
+                            reads.abort_all();
                             break;
                         }
                     }
                 }
             }
+            answers.sort_by_key(|(index, ..)| *index);
+            let shows: Vec<_> = answers
+                .into_iter()
+                .map(|(_, show, items)| (show, items))
+                .collect();
             ApiResponse::HomeEpisodes {
                 generation,
                 result: match failure {
@@ -4404,7 +5817,7 @@ async fn handle(
                 RemoteAction::Next => routed!(next(device)),
                 RemoteAction::Previous => routed!(previous(device)),
                 RemoteAction::Seek => routed!(seek(position_ms, device)),
-                RemoteAction::Volume => routed!(set_volume(percent, device)),
+                RemoteAction::Volume { .. } => routed!(set_volume(percent, device)),
                 RemoteAction::Shuffle => routed!(set_shuffle(flag, device)),
                 RemoteAction::Repeat => routed!(set_repeat(&repeat, device)),
             };
@@ -4453,7 +5866,7 @@ async fn handle(
         }
     };
     observe_playlists(api, &response);
-    (response, expired.get())
+    (response, expired.get().into_iter().collect())
 }
 
 /// Player commands for a device the Web API refuses (a Sonos, say) go over
@@ -4569,15 +5982,28 @@ fn same_account(username: &str, account: Option<&AccountId>) -> bool {
 /// the operating system, which is far longer than a page should spin.
 const SESSION_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Answers a playlist or popular-track read over the streaming session. `None` when the
+/// Whether the playlist library is read from the playback session's
+/// rootlist: when the shared app, which lists it with every field, cannot
+/// answer now, because it is still verifying sign-in or waiting out a rate
+/// limit (#698, #816). A personal app lists only part of it, leaving out
+/// Spotify's own playlists, so it is no substitute.
+async fn library_over_session(api: &ApiGateway, operation: Operation) -> bool {
+    operation == Operation::PlaylistLibrary && !api.shared_available().await
+}
+
+/// Answers a supported read over the streaming session. `None` when the
 /// session could not, leaving the request to the Web API.
-async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiResponse> {
+async fn over_session(
+    engine: &Engine,
+    web: Option<&ApiClient>,
+    request: &ApiRequest,
+) -> Option<ApiResponse> {
     let session = engine.session();
     let read = async {
         Some(match session_read(request)? {
-            SessionRead::Header { id } => {
-                SessionAnswer::Header(settle(session_reads::playlist(session, id).await)?)
-            }
+            SessionRead::Header { id } => SessionAnswer::Header(Box::new(settle(
+                session_reads::playlist(session, id).await,
+            )?)),
             SessionRead::Rows { id, offset } => SessionAnswer::Rows(settle(
                 session_reads::items(session, id, offset, PLAYLIST_PAGE_SIZE).await,
             )?),
@@ -4587,6 +6013,12 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
             SessionRead::ArtistTop { id } => SessionAnswer::ArtistTop(settle(
                 session_reads::artist_top_tracks(session, id).await,
             )?),
+            SessionRead::RelatedArtists { id } => SessionAnswer::RelatedArtists(settle(
+                session_reads::related_artists(session, web?, id).await,
+            )?),
+            SessionRead::Library => {
+                SessionAnswer::Library(settle(session_reads::library(session).await)?)
+            }
         })
     };
     let Ok(answer) = tokio::time::timeout(SESSION_READ_TIMEOUT, read).await else {
@@ -4596,20 +6028,36 @@ async fn over_session(engine: &Engine, request: &ApiRequest) -> Option<ApiRespon
     session_response(request, answer?)
 }
 
-/// The read a request asks of the session: a playlist's header, a page of
-/// its rows, or a sample of who added them, which needs no song details.
+/// The read a request asks of the session: artist cards or popular tracks,
+/// a playlist's header, a page of rows, or a sample of who added them.
 /// Anything else, a duplicate check among them, is the Web API's even
 /// where the session serves the operation.
 #[derive(Debug, PartialEq)]
 enum SessionRead<'a> {
-    ArtistTop { id: &'a str },
-    Header { id: &'a str },
-    Rows { id: &'a str, offset: u32 },
-    Sample { id: &'a str, offset: u32 },
+    RelatedArtists {
+        id: &'a str,
+    },
+    ArtistTop {
+        id: &'a str,
+    },
+    Header {
+        id: &'a str,
+    },
+    Rows {
+        id: &'a str,
+        offset: u32,
+    },
+    Sample {
+        id: &'a str,
+        offset: u32,
+    },
+    /// The whole playlist library, whichever page was asked for.
+    Library,
 }
 
 fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
     Some(match request {
+        ApiRequest::RelatedArtists { id } => SessionRead::RelatedArtists { id },
         ApiRequest::ArtistTopTracks { id } => SessionRead::ArtistTop { id },
         ApiRequest::Playlist { id, .. } => SessionRead::Header { id },
         ApiRequest::PlaylistItems { id, offset, .. } => SessionRead::Rows {
@@ -4620,21 +6068,31 @@ fn session_read(request: &ApiRequest) -> Option<SessionRead<'_>> {
             id,
             offset: *offset,
         },
+        ApiRequest::MyPlaylists { .. } => SessionRead::Library,
         _ => return None,
     })
 }
 
-/// What the session read: a playlist's header, or a page of its rows.
+/// What the session read: artist cards or tracks, a playlist's header,
+/// a page of its rows, or the whole playlist library.
 enum SessionAnswer {
+    RelatedArtists(ApiResult<Vec<Artist>>),
     ArtistTop(ApiResult<Vec<Track>>),
-    Header(ApiResult<Playlist>),
+    Header(Box<ApiResult<Playlist>>),
     Rows(ApiResult<Page<PlaylistItem>>),
+    Library(ApiResult<Vec<Playlist>>),
 }
 
 /// The response a session answer becomes, carrying the request's own id,
 /// offset, and generation so the app matches it to the page that asked.
 fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiResponse> {
     Some(match (request, answer) {
+        (ApiRequest::RelatedArtists { id }, SessionAnswer::RelatedArtists(result)) => {
+            ApiResponse::RelatedArtists {
+                id: id.clone(),
+                result,
+            }
+        }
         (ApiRequest::ArtistTopTracks { id }, SessionAnswer::ArtistTop(result)) => {
             ApiResponse::ArtistTopTracks {
                 id: id.clone(),
@@ -4645,7 +6103,7 @@ fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiRe
             ApiResponse::Playlist {
                 id: id.clone(),
                 generation: *generation,
-                result,
+                result: *result,
             }
         }
         (
@@ -4666,6 +6124,16 @@ fn session_response(request: &ApiRequest, answer: SessionAnswer) -> Option<ApiRe
                 id: id.clone(),
                 generation: *generation,
                 result,
+            }
+        }
+        // The session reads the library whole, so its answer starts the
+        // list over at the top, whichever page of a Web API load asked: it
+        // holds every row that load had shown, and the rest.
+        (ApiRequest::MyPlaylists { generation, .. }, SessionAnswer::Library(result)) => {
+            ApiResponse::MyPlaylists {
+                offset: 0,
+                generation: *generation,
+                result: result.map(Page::whole),
             }
         }
         _ => return None,
@@ -4755,7 +6223,16 @@ async fn read_playlist_cache(path: std::path::PathBuf) -> std::io::Result<(Cache
         {
             log::warn!("unable to clean playlist cache {}: {error}", path.display());
         }
-        cache
+        cache.map(|(mut cached, appendable)| {
+            for row in &mut cached.items {
+                for item in row.item.iter_mut().chain(row.track.iter_mut()) {
+                    if let PlayableItem::Track(track) = item {
+                        session_reads::normalize_local_track_labels(track);
+                    }
+                }
+            }
+            (cached, appendable)
+        })
     })
     .await
     .map_err(std::io::Error::other)?
@@ -5383,6 +6860,78 @@ mod playlist_cache_tests {
         assert_eq!(cached.next_offset, None);
     }
 
+    #[tokio::test]
+    async fn cached_local_track_labels_are_normalized_on_restore() {
+        let root = std::env::temp_dir().join(format!(
+            "spotifast-local-labels-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let raw: PlaylistItem = serde_json::from_value(serde_json::json!({
+            "added_at": "2026-10-26T10:00:00Z", "is_local": true,
+            "item": {
+                "type": "track",
+                "uri": "spotify:local:Tan+Bi%C3%B3nica:Boquitas+Pintadas:Tel%C3%A9fonos:180",
+                "name": "Tel%C3%A9fonos", "duration_ms": 180_000, "is_local": true,
+                "artists": [{"name": "Tan+Bi%C3%B3nica"}],
+                "album": {"name": "Boquitas+Pintadas"}
+            }
+        }))
+        .unwrap();
+        let mut expected = raw.clone();
+        let Some(PlayableItem::Track(track)) = expected.item.as_mut() else {
+            panic!("a local file is a track");
+        };
+        track.name = "Teléfonos".into();
+        track.artists[0].name = "Tan Biónica".into();
+        track.album.as_mut().unwrap().name = "Boquitas Pintadas".into();
+        // Cache rows can store either the session's `item` or the Web API's `track`.
+        let mut api_row = raw.clone();
+        api_row.track = api_row.item.take();
+        let mut expected_api = expected.clone();
+        expected_api.track = expected_api.item.take();
+        for incremental in [false, true] {
+            let path = root.join(format!("{incremental}.json"));
+            let items = vec![raw.clone(), api_row.clone(), PlaylistItem::default()];
+            if incremental {
+                write_incremental_playlist_cache_file(
+                    &path,
+                    "snapshot".into(),
+                    PlaylistCacheRows::Replace(items),
+                    10,
+                    Some(3),
+                )
+                .unwrap();
+            } else {
+                write_cached_playlist(
+                    path.clone(),
+                    CachedPlaylist {
+                        snapshot: "snapshot".into(),
+                        items,
+                        total: Some(10),
+                        next_offset: Some(3),
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            let (cached, appendable) = read_playlist_cache(path).await.unwrap();
+            assert_eq!(
+                cached.items,
+                [
+                    expected.clone(),
+                    expected_api.clone(),
+                    PlaylistItem::default()
+                ]
+            );
+            assert_eq!(cached.snapshot, "snapshot");
+            assert_eq!(cached.total, Some(10));
+            assert_eq!(cached.next_offset, Some(3));
+            assert_eq!(appendable, incremental);
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn incremental_checkpoints_append_only_new_rows_and_recover_from_failed_publication() {
         let root = std::env::temp_dir().join(format!(
@@ -5779,6 +7328,40 @@ fn playback_credentials(account: Option<AccountId>, access_token: String) -> Opt
 
 #[cfg(test)]
 mod authorization_tests {
+    #[test]
+    fn failed_connect_resolution_keeps_only_current_cast_results() {
+        let cast = crate::zeroconf::Receiver {
+            name: "Current Cast".into(),
+            device_id: Some("cast".into()),
+            address: "192.0.2.1".parse().unwrap(),
+            port: 8009,
+            path: "/".into(),
+            cast: true,
+        };
+        let connect = crate::zeroconf::Receiver {
+            cast: false,
+            ..cast.clone()
+        };
+        let final_rows = receiver_snapshot(vec![connect, cast.clone()], |_| {
+            Err(anyhow::anyhow!("HTTP client initialization failed"))
+        });
+        assert_eq!(final_rows, [cast]);
+        // A service removed during the browse must not survive through progress.
+        assert!(receiver_snapshot(Vec::new(), |_| Err(anyhow::anyhow!("failed"))).is_empty());
+        assert!(receiver_snapshot(final_rows, |_| Ok(Vec::new())).is_empty());
+    }
+
+    #[test]
+    fn opening_the_picker_again_does_not_start_a_second_receiver_scan() {
+        let (runtime, mut worker, _) = worker("coalesce-receiver-scan");
+        let _entered = runtime.enter();
+        let pending = runtime.spawn(std::future::pending::<()>());
+        let id = pending.id();
+        worker.receiver_discovery = Some(pending);
+        worker.discover_receivers();
+        assert_eq!(worker.receiver_discovery.as_ref().unwrap().id(), id);
+        worker.receiver_discovery.take().unwrap().abort();
+    }
     use super::*;
 
     #[test]
@@ -6091,7 +7674,7 @@ mod authorization_tests {
         worker.engine_proxy = Some(old_url.clone());
         worker.signed_in = true;
         worker.engine_busy = true;
-        worker.change_proxy(1, ProxyConfig::Off, false);
+        worker.change_proxy(1, ProxyConfig::Off, None);
         assert!(
             worker.engine_restart_pending,
             "Off must discard an in-flight connection using the former system proxy"
@@ -6220,6 +7803,7 @@ mod authorization_tests {
             address: "127.0.0.1".parse().unwrap(),
             port: 1400,
             path: "/spotifyzc".into(),
+            cast: false,
         }]);
         assert_eq!(worker.connect.restricted_target(None), None);
         assert_eq!(worker.connect.restricted_target(Some("sonos")), None);
@@ -6253,7 +7837,7 @@ mod authorization_tests {
         let _entered = runtime.enter();
         worker.restoring_proxy = true;
         let old = worker.credentials.lease(CredentialSlot::Proxy);
-        worker.change_proxy(1, ProxyConfig::System, false);
+        worker.change_proxy(1, ProxyConfig::System, None);
         assert!(!worker.restoring_proxy);
         assert!(worker.http.client().is_ok());
         worker.on_proxy_restored(
@@ -6301,7 +7885,7 @@ mod authorization_tests {
         let _entered = runtime.enter();
         let original = worker.engine_config.proxy.clone();
         let bad = ProxyConfig::Invalid("Proxy port must be a number".into());
-        worker.change_proxy(1, bad.clone(), false);
+        worker.change_proxy(1, bad.clone(), None);
         assert_eq!(worker.engine_config.proxy, original);
         assert!(!worker.engine_restart_pending);
         assert!(worker.http.client().is_ok());
@@ -6319,7 +7903,7 @@ mod authorization_tests {
             verify(&mut worker, ApiSource::Shared, "alice");
             let old = worker.credentials.lease(CredentialSlot::Shared);
             let grant = StoredGrant::Web(crate::auth::StoredToken {
-                client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+                client_id: "dummy-shared-client".into(),
                 access_token: "dummy-expired-access".into(),
                 refresh_token: "dummy-rejected-refresh".into(),
                 ..Default::default()
@@ -6354,6 +7938,176 @@ mod authorization_tests {
         });
     }
 
+    /// Spotify refusing the shared grant of a listener who also has a
+    /// personal app leaves them signed in with it; refusing the personal
+    /// app's grant too, the last one, signs them out.
+    #[test]
+    fn a_refused_shared_grant_leaves_the_personal_app_signed_in() {
+        let (runtime, mut worker, events) = worker("refused-shared-keeps-personal");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        verify(&mut worker, ApiSource::Personal, "alice");
+        let _ = events.try_iter().collect::<Vec<_>>();
+        let finished = |worker: &Worker, expired: ApiSource| Command::ApiFinished {
+            generation: *worker.session.borrow(),
+            home_account: None,
+            response: Box::new(ApiResponse::Me(Err(ApiError::SignInExpired {
+                api_source: expired,
+            }))),
+            expired: vec![expired],
+            shared_lease: worker.credentials.lease(CredentialSlot::Shared),
+            personal_lease: worker.credentials.lease(CredentialSlot::Personal),
+        };
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands.send(finished(&worker, ApiSource::Shared)).unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(worker.signed_in);
+        assert!(!worker.api.has_shared());
+        assert!(worker.api.personal_ready());
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, Event::Auth(AuthStatus::Failed(_))))
+        );
+
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands
+            .send(finished(&worker, ApiSource::Personal))
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(!worker.signed_in);
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::Expired))
+        )));
+    }
+
+    /// The sign-in screen's button signs in with the Client ID typed there,
+    /// and its problems show on that screen rather than as a toast behind
+    /// it. What cannot be a Client ID never reaches the browser, and shared
+    /// access takes no new sign-ins.
+    #[test]
+    fn the_sign_in_screen_signs_in_with_the_listeners_own_app() {
+        let _turn = WEB_PORT.lock().unwrap_or_else(|poison| poison.into_inner());
+        let (runtime, mut worker, events) = worker("sign-in-with-personal");
+        let _entered = runtime.enter();
+        let _occupied =
+            std::net::TcpListener::bind(("127.0.0.1", crate::auth::WEB_REDIRECT_PORT)).unwrap();
+        for typed in [
+            None,
+            Some("".into()),
+            Some("https://developer.spotify.com".into()),
+        ] {
+            worker.sign_in(typed);
+            let received: Vec<_> = events.try_iter().collect();
+            assert!(received.iter().any(|event| matches!(
+                event,
+                Event::Auth(AuthStatus::Refused(SignInProblem::MalformedClientId))
+            )));
+            assert_eq!(worker.authorization_attempt, 0);
+        }
+
+        worker.sign_in_source(ApiSource::Shared);
+        assert!(worker.cancel_signin.is_none());
+        assert_eq!(
+            worker.api.state(ApiSource::Shared),
+            SessionState::Unavailable
+        );
+
+        let id = "0123456789abcdef0123456789abcdef";
+        worker.sign_in(Some(format!(" {id} ")));
+        assert_eq!(worker.web_client_id.as_deref(), Some(id));
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(received.iter().any(|event| matches!(event,
+            Event::Auth(AuthStatus::Failed(message)) if message.contains("8989")
+        )));
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+        assert_eq!(
+            worker.api.state(ApiSource::Shared),
+            SessionState::Unavailable
+        );
+    }
+
+    /// Choosing another app in Settings while it is the only grant, and
+    /// never finishing its sign-in, returns to the sign-in screen rather
+    /// than leaving an app that nothing answers.
+    #[test]
+    fn an_unfinished_switch_of_the_only_app_returns_to_sign_in() {
+        let (runtime, mut worker, events) = worker("unfinished-switch");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Personal, "alice");
+        worker.api.clear(ApiSource::Personal);
+        worker.authorizing_source = Some(ApiSource::Personal);
+        let _ = events.try_iter().collect::<Vec<_>>();
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands
+            .send(Command::SignInEnded {
+                source: ApiSource::Personal,
+                attempt: worker.authorization_attempt,
+            })
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(!worker.signed_in);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Auth(AuthStatus::SignedOut)))
+        );
+    }
+
+    /// Spotify refusing the shared grant with nothing else signed in sends
+    /// the listener to set up their own app, and says why; a personal app
+    /// that does not let the account in says that instead.
+    #[test]
+    fn refusals_say_what_to_do() {
+        let (runtime, mut worker, events) = worker("refusals");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.on_web_verification_failed(
+            ApiSource::Shared,
+            ApiError::SignInExpired {
+                api_source: ApiSource::Shared,
+            },
+        );
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(received.iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::SharedRetired))
+        )));
+        assert!(
+            received
+                .iter()
+                .any(|event| matches!(event, Event::SharedGrant(false)))
+        );
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+
+        worker
+            .api
+            .set_state(ApiSource::Personal, SessionState::Authorizing);
+        worker.on_web_verification_failed(
+            ApiSource::Personal,
+            ApiError::Status {
+                status: 403,
+                message: "Check settings on developer.spotify.com/dashboard".into(),
+            },
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Auth(AuthStatus::Refused(SignInProblem::AccountNotAllowed))
+        )));
+    }
+
     #[test]
     fn old_api_and_verification_errors_cannot_sign_out_a_new_session() {
         let (runtime, mut worker, events) = worker("old-api-after-sign-in");
@@ -6369,10 +8123,11 @@ mod authorization_tests {
         commands
             .send(Command::ApiFinished {
                 generation,
+                home_account: None,
                 response: Box::new(ApiResponse::Me(Err(ApiError::SignInExpired {
                     api_source: ApiSource::Shared,
                 }))),
-                expired: Some(ApiSource::Shared),
+                expired: vec![ApiSource::Shared],
                 shared_lease: shared.clone(),
                 personal_lease: personal,
             })
@@ -6392,6 +8147,264 @@ mod authorization_tests {
         assert!(worker.signed_in);
         assert_eq!(worker.api.account(), Some(AccountId::new("bob")));
         assert!(events.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn prerelease_waits_for_restore_and_reports_a_missing_playback_grant() {
+        let (_runtime, mut worker, events) = worker("prerelease-cold-start");
+        worker.signed_in = true;
+        worker.restore_pending[CredentialSlot::Playback.index()] = true;
+        worker.prerelease_waiting = Some(("spotify:prerelease:0kRaNkRxpO16BjxJU0IQAL".into(), 4));
+        worker.start_prerelease();
+        assert!(worker.prerelease_waiting.is_some());
+        assert!(events.try_recv().is_err());
+        worker.on_credentials_restored(
+            CredentialSlot::Playback,
+            worker.credentials.lease(CredentialSlot::Playback),
+            Ok(crate::credentials::Loaded {
+                grant: None,
+                warning: None,
+            }),
+        );
+        assert!(worker.prerelease_waiting.is_none());
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Prerelease {
+                generation: 4,
+                result: Err(_),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn offline_prerelease_without_playback_credentials_reports_authorization_before_reconnect() {
+        let (runtime, mut worker, events) = worker("prerelease-offline-no-grant");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        let uri = "spotify:prerelease:0kRaNkRxpO16BjxJU0IQAL";
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands.send(Command::NetworkStatus(false)).unwrap();
+        commands
+            .send(Command::Prerelease {
+                uri: uri.into(),
+                generation: 8,
+            })
+            .unwrap();
+        commands.send(Command::NetworkStatus(true)).unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+
+        assert!(worker.prerelease_waiting.is_none());
+        assert!(!worker.waiting_for_network);
+        assert!(!worker.engine_busy);
+        let received = events.try_iter().collect::<Vec<_>>();
+        let failure = received.iter().position(|event| {
+            matches!(
+                event,
+                Event::Prerelease {
+                    uri: returned_uri,
+                    generation: 8,
+                    result: Err(error),
+                } if returned_uri == uri && error.contains("playback authorization")
+            )
+        });
+        let reconnected = received
+            .iter()
+            .position(|event| matches!(event, Event::NetworkStatus(true)));
+        assert!(failure.unwrap() < reconnected.unwrap());
+    }
+
+    #[test]
+    fn prerelease_waits_for_network_without_losing_the_pending_page() {
+        let (runtime, mut worker, events) = worker("prerelease-offline");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.playback_grant = Some(Credentials::with_password("alice", "grant"));
+        worker.network_reachable = false;
+        worker.prerelease_waiting = Some(("spotify:prerelease:0kRaNkRxpO16BjxJU0IQAL".into(), 5));
+        worker.start_prerelease();
+        assert!(worker.prerelease_waiting.is_some());
+        assert!(worker.waiting_for_network);
+        assert!(!worker.engine_busy);
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, Event::Prerelease { .. }))
+        );
+    }
+
+    #[test]
+    fn prerelease_waits_with_fresh_pending_credentials_while_offline() {
+        let (runtime, mut worker, events) = worker("prerelease-pending-offline");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.pending_playback_grant = Some(Credentials::with_password("alice", "fresh-grant"));
+        worker.network_reachable = false;
+        worker.prerelease_waiting = Some(("spotify:prerelease:0kRaNkRxpO16BjxJU0IQAL".into(), 7));
+        worker.start_prerelease();
+        assert!(worker.prerelease_waiting.is_some());
+        assert!(worker.waiting_for_network);
+        assert!(worker.pending_playback_grant.is_some());
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, Event::Prerelease { .. }))
+        );
+    }
+
+    #[test]
+    fn terminal_playback_failure_finishes_a_queued_prerelease() {
+        let (runtime, mut worker, events) = worker("prerelease-terminal-error");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.prerelease_waiting = Some(("spotify:prerelease:0kRaNkRxpO16BjxJU0IQAL".into(), 6));
+        worker.on_engine_connected(
+            worker.album_type_lookup.session_generation,
+            None,
+            Some("bad credentials".into()),
+            worker.engine_attempt,
+        );
+        assert!(worker.prerelease_waiting.is_none());
+        assert!(events.try_iter().any(|event| matches!(
+            event,
+            Event::Prerelease {
+                generation: 6,
+                result: Err(_),
+                ..
+            }
+        )));
+    }
+
+    /// Successful fallback cards still revoke the expired personal grant on the command loop.
+    #[test]
+    fn successful_home_fallback_clears_only_the_expired_personal_grant() {
+        let (runtime, mut worker, events) = worker("home-fallback-expiration");
+        let _entered = runtime.enter();
+        for source in [ApiSource::Shared, ApiSource::Personal] {
+            worker.api.install(source, AccountId::new("alice")).unwrap();
+        }
+        let personal_lease = worker.credentials.lease(CredentialSlot::Personal);
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands
+            .send(Command::ApiFinished {
+                generation: *worker.session.borrow(),
+                home_account: Some(AccountId::new("alice")),
+                response: Box::new(ApiResponse::MadeForYou {
+                    generation: 1,
+                    personalized: false,
+                    result: Ok(Vec::new()),
+                    top_mixes: Err(ApiError::RateLimited),
+                }),
+                expired: vec![ApiSource::Personal],
+                shared_lease: worker.credentials.lease(CredentialSlot::Shared),
+                personal_lease: personal_lease.clone(),
+            })
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert!(!personal_lease.current());
+        assert!(!worker.api.personal_ready());
+        assert_eq!(worker.api.account(), Some(AccountId::new("alice")));
+        assert!(events.try_iter().any(|event| matches!(
+            event, Event::Api(response) if matches!(response.as_ref(),
+                ApiResponse::MadeForYou { personalized: false, result: Ok(_), .. })
+        )));
+    }
+
+    /// A Home answer cannot cross account replacement or grant renewal without sign-out.
+    #[test]
+    fn late_home_answers_are_discarded_after_reauthorization() {
+        for replace_account in [false, true] {
+            let (runtime, mut worker, events) = worker("late-home-reauthorization");
+            let _entered = runtime.enter();
+            worker
+                .api
+                .install(ApiSource::Shared, AccountId::new("alice"))
+                .unwrap();
+            let shared_lease = worker.credentials.lease(CredentialSlot::Shared);
+            let personal_lease = worker.credentials.lease(CredentialSlot::Personal);
+            if replace_account {
+                worker.api.clear(ApiSource::Shared);
+                worker
+                    .api
+                    .install(ApiSource::Shared, AccountId::new("bob"))
+                    .unwrap();
+            } else {
+                worker.credentials.invalidate(CredentialSlot::Shared);
+            }
+            let (commands, receiver) = mpsc::unbounded_channel();
+            commands
+                .send(Command::ApiFinished {
+                    generation: *worker.session.borrow(),
+                    home_account: Some(AccountId::new("alice")),
+                    response: Box::new(ApiResponse::MadeForYou {
+                        generation: 1,
+                        personalized: true,
+                        result: Ok(vec![Playlist {
+                            id: "old-account".into(),
+                            ..Default::default()
+                        }]),
+                        top_mixes: Ok(Vec::new()),
+                    }),
+                    expired: Vec::new(),
+                    shared_lease,
+                    personal_lease,
+                })
+                .unwrap();
+            commands.send(Command::Shutdown).unwrap();
+            runtime.block_on(worker.run(receiver));
+            assert!(
+                events
+                    .try_iter()
+                    .all(|event| !matches!(event, Event::Api(_)))
+            );
+        }
+    }
+
+    /// Top mixes open like Made for you cards once a Home answer names their owner.
+    #[test]
+    fn home_answers_record_top_mix_ownership() {
+        let (runtime, mut worker, events) = worker("home-top-mixes-access");
+        let _entered = runtime.enter();
+        worker
+            .api
+            .install(ApiSource::Shared, AccountId::new("alice"))
+            .unwrap();
+        let mix = Playlist {
+            id: "mix".into(),
+            owner: Owner {
+                id: Some("spotify".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (commands, receiver) = mpsc::unbounded_channel();
+        commands
+            .send(Command::ApiFinished {
+                generation: *worker.session.borrow(),
+                home_account: Some(AccountId::new("alice")),
+                response: Box::new(ApiResponse::MadeForYou {
+                    generation: 1,
+                    personalized: true,
+                    result: Ok(Vec::new()),
+                    top_mixes: Ok(vec![mix]),
+                }),
+                expired: Vec::new(),
+                shared_lease: worker.credentials.lease(CredentialSlot::Shared),
+                personal_lease: worker.credentials.lease(CredentialSlot::Personal),
+            })
+            .unwrap();
+        commands.send(Command::Shutdown).unwrap();
+        runtime.block_on(worker.run(receiver));
+        assert_eq!(
+            worker.api.playlist_access("mix"),
+            crate::api::PlaylistAccess::External
+        );
+        assert!(events.try_iter().any(|event| matches!(
+            event, Event::Api(response) if matches!(response.as_ref(),
+                ApiResponse::MadeForYou { top_mixes: Ok(mixes), .. } if mixes.len() == 1)
+        )));
     }
 
     pub(super) fn worker(
@@ -6420,6 +8433,7 @@ mod authorization_tests {
             ProxyConfig::Off,
             crate::vis::AudioTap::new(),
             crate::eq::shared(),
+            crate::effects::shared(),
         );
         let http = Http::new(reqwest::Client::new());
         let art = ArtLoader::new(http.clone(), runtime.handle().clone(), dirs.art_cache_dir());
@@ -6440,13 +8454,36 @@ mod authorization_tests {
     }
 
     #[test]
+    fn a_rate_change_without_local_playback_is_not_an_error() {
+        let (runtime, mut worker, events) = worker("rate-without-engine");
+        let _entered = runtime.enter();
+        worker.player_without_engine(PlayerCommand::Rate(1.5));
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(_))),
+            "the effects popover must not toast while nothing plays here"
+        );
+        worker.player_without_engine(PlayerCommand::Next);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Error(_)))
+        );
+    }
+
+    /// Tests that bind the personal app's callback port take turns.
+    static WEB_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
     fn occupied_login_port_reports_persistent_failure_before_browser_sign_in() {
+        let _turn = WEB_PORT.lock().unwrap_or_else(|poison| poison.into_inner());
         let (runtime, mut worker, events) = worker("occupied-login-port");
         let _entered = runtime.enter();
         let _occupied =
             std::net::TcpListener::bind(("127.0.0.1", crate::auth::WEB_REDIRECT_PORT)).unwrap();
         for _ in 0..2 {
-            worker.sign_in_source(ApiSource::Shared);
+            worker.sign_in_source(ApiSource::Personal);
             let received: Vec<_> = events.try_iter().collect();
             assert!(received.iter().any(|event| matches!(event,
                 Event::Auth(AuthStatus::Failed(message)) if message.contains("8989")
@@ -6461,6 +8498,207 @@ mod authorization_tests {
             assert!(worker.authorizing_source.is_none());
             assert_eq!(worker.authorization_attempt, 0);
         }
+    }
+
+    /// Tests that bind the playback callback port take turns.
+    static PLAYBACK_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn failed(events: &std::sync::mpsc::Receiver<Event>) -> Vec<String> {
+        events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Playback(LocalPlayback::Failed(message)) => Some(message),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A connection reset with the network up is retried with the saved
+    /// grant, quietly and with a growing backoff (#818).
+    #[test]
+    fn failed_engine_connection_retries_with_the_saved_grant() {
+        let (runtime, mut worker, events) = worker("engine-retry");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.playback_grant = Some(Credentials::with_password("alice", "dummy-grant"));
+        let session = worker.album_type_lookup.session_generation;
+        let reset = "Couldn't reach Spotify: connection reset";
+
+        worker.connect_engine(Credentials::with_password("alice", "dummy-grant"));
+        worker.on_engine_connected(session, None, Some(reset.into()), worker.engine_attempt);
+        assert_eq!(failed(&events), [reset]);
+        assert_eq!(worker.engine_retries, 1);
+        assert!(worker.playback_grant.is_some());
+
+        // A retry superseded by something newer does nothing.
+        worker.retry_engine(worker.engine_retry_generation - 1);
+        assert!(!worker.engine_busy);
+
+        worker.retry_engine(worker.engine_retry_generation);
+        assert!(worker.engine_busy);
+        assert!(worker.engine_retry_quiet);
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Playback(LocalPlayback::Connecting))),
+            "a background retry flickered the status"
+        );
+        worker.on_engine_connected(session, None, Some(reset.into()), worker.engine_attempt);
+        assert!(
+            failed(&events).is_empty(),
+            "a quiet retry repeated the error"
+        );
+        assert_eq!(worker.engine_retries, 2);
+        assert!(!worker.engine_retry_quiet);
+    }
+
+    /// A rejected grant is not retried in the background, and nothing is
+    /// retried while the network is down.
+    #[test]
+    fn rejected_grant_and_offline_failures_are_not_retried() {
+        let (runtime, mut worker, events) = worker("engine-retry-rejected");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.playback_grant = Some(Credentials::with_password("alice", "dummy-grant"));
+        let session = worker.album_type_lookup.session_generation;
+
+        worker.connect_engine(Credentials::with_password("alice", "dummy-grant"));
+        worker.on_engine_connected(
+            session,
+            None,
+            Some("Spotify rejected the saved sign-in. Please sign in again.".into()),
+            worker.engine_attempt,
+        );
+        assert_eq!(failed(&events).len(), 1);
+        assert_eq!(worker.engine_retries, 0);
+
+        worker.network_reachable = false;
+        worker.connect_engine(Credentials::with_password("alice", "dummy-grant"));
+        worker.on_engine_connected(
+            session,
+            None,
+            Some("timed out".into()),
+            worker.engine_attempt,
+        );
+        assert!(worker.waiting_for_network);
+        assert_eq!(worker.engine_retries, 0);
+    }
+
+    /// "Set up playback here" reconnects with a saved grant instead of
+    /// clearing it and opening the browser (#818, #824).
+    #[test]
+    fn set_up_playback_reconnects_with_the_saved_grant_first() {
+        let (runtime, mut worker, events) = worker("set-up-with-saved-grant");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.playback_grant = Some(Credentials::with_password("alice", "dummy-grant"));
+        let lease = worker.credentials.lease(CredentialSlot::Playback);
+        let attempt = worker.authorization_attempt;
+        let _ = events.try_iter().count();
+
+        worker.authorize_playback();
+
+        assert!(worker.engine_busy);
+        assert!(worker.authorize_if_rejected);
+        assert!(worker.cancel_signin.is_none());
+        assert_eq!(worker.authorization_attempt, attempt);
+        assert!(lease.current(), "the saved grant was invalidated");
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(
+            received
+                .iter()
+                .any(|event| matches!(event, Event::Playback(LocalPlayback::Connecting)))
+        );
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Playback(LocalPlayback::Authorizing)))
+        );
+
+        // Only Spotify rejecting the grant goes to the browser. The port is
+        // held so the browser flow stops at its port check and opens nothing.
+        let _port = PLAYBACK_PORT.lock().unwrap_or_else(|p| p.into_inner());
+        let _occupied =
+            std::net::TcpListener::bind(("127.0.0.1", crate::auth::PLAYBACK_REDIRECT_PORT))
+                .unwrap();
+        let session = worker.album_type_lookup.session_generation;
+        worker.on_engine_connected(
+            session,
+            None,
+            Some("Spotify rejected the saved sign-in. Please sign in again.".into()),
+            worker.engine_attempt,
+        );
+        let messages = failed(&events);
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("8898"), "{messages:?}");
+        assert!(!worker.authorize_if_rejected);
+    }
+
+    /// Clicking while a background retry is connecting shows that attempt
+    /// rather than starting another one.
+    #[test]
+    fn set_up_playback_during_a_quiet_retry_shows_it() {
+        let (runtime, mut worker, events) = worker("set-up-during-retry");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        worker.playback_grant = Some(Credentials::with_password("alice", "dummy-grant"));
+        worker.engine_retry_quiet = true;
+        worker.connect_engine(Credentials::with_password("alice", "dummy-grant"));
+        let engine_attempt = worker.engine_attempt;
+        let _ = events.try_iter().count();
+
+        worker.authorize_playback();
+
+        assert_eq!(worker.engine_attempt, engine_attempt);
+        assert!(!worker.engine_retry_quiet);
+        assert!(worker.authorize_if_rejected);
+        assert!(
+            events
+                .try_iter()
+                .any(|event| matches!(event, Event::Playback(LocalPlayback::Connecting)))
+        );
+    }
+
+    /// A busy playback callback port reports the conflict and leaves the
+    /// saved playback grant alone, without opening the browser (#899).
+    #[test]
+    fn occupied_playback_port_keeps_the_saved_grant() {
+        let _port = PLAYBACK_PORT.lock().unwrap_or_else(|p| p.into_inner());
+        let (runtime, mut worker, events) = worker("occupied-playback-port");
+        let _entered = runtime.enter();
+        verify(&mut worker, ApiSource::Shared, "alice");
+        let saved = worker.credentials.lease(CredentialSlot::Playback);
+        runtime
+            .block_on(saved.save(StoredGrant::Playback(Credentials::with_password(
+                "alice",
+                "dummy-saved-grant",
+            ))))
+            .unwrap();
+        let _ = events.try_iter().count();
+        let _occupied =
+            std::net::TcpListener::bind(("127.0.0.1", crate::auth::PLAYBACK_REDIRECT_PORT))
+                .unwrap();
+        let attempt = worker.authorization_attempt;
+
+        worker.authorize_playback();
+
+        let received: Vec<_> = events.try_iter().collect();
+        assert!(received.iter().any(|event| matches!(event,
+            Event::Playback(LocalPlayback::Failed(message)) if message.contains("8898")
+        )));
+        assert!(
+            !received
+                .iter()
+                .any(|event| matches!(event, Event::Playback(LocalPlayback::Authorizing)))
+        );
+        assert!(worker.cancel_signin.is_none());
+        assert_eq!(worker.authorization_attempt, attempt);
+        assert!(saved.current(), "the saved grant was invalidated");
+        assert!(matches!(
+            runtime.block_on(saved.load()).unwrap().grant,
+            Some(StoredGrant::Playback(grant)) if grant.username.as_deref() == Some("alice")
+        ));
     }
 
     #[test]
@@ -6569,7 +8807,7 @@ mod authorization_tests {
             let lease = worker.credentials.lease(slot);
             let token = crate::auth::StoredToken {
                 client_id: if slot == CredentialSlot::Shared {
-                    crate::auth::DEFAULT_WEB_CLIENT_ID.into()
+                    "dummy-shared-client".into()
                 } else {
                     "personal".into()
                 },
@@ -6593,12 +8831,13 @@ mod authorization_tests {
             assert!(worker.web_tokens[slot.index()].is_none());
             assert!(!worker.signed_in);
             let emitted: Vec<_> = events.try_iter().collect();
-            // Signing in renews the shared app; a personal app is renewed only
-            // by authorizing it again in Settings (#634).
+            // A shared grant cannot be renewed, so it points at the
+            // listener's own app; a personal app is renewed by signing in
+            // with it, or in Settings (#634).
             let advice = if slot == CredentialSlot::Shared {
-                "Sign in again."
+                "Sign in with your own Spotify app."
             } else {
-                "Authorize it again in Settings, under Account."
+                "with Sign in or in Settings, under Account."
             };
             assert!(emitted.iter().any(|event| matches!(event,
                 Event::Error(message)
@@ -6622,7 +8861,7 @@ mod authorization_tests {
         let attempt = worker.authorization_attempt;
         let album_type_session = worker.album_type_lookup.session_generation;
         let token = crate::auth::StoredToken {
-            client_id: crate::auth::DEFAULT_WEB_CLIENT_ID.into(),
+            client_id: "dummy-shared-client".into(),
             access_token: "dummy-access".into(),
             refresh_token: "dummy-refresh".into(),
             ..Default::default()
@@ -6815,7 +9054,7 @@ mod authorization_tests {
                 client_id: if source == ApiSource::Personal {
                     "personal"
                 } else {
-                    crate::auth::DEFAULT_WEB_CLIENT_ID
+                    "dummy-shared-client"
                 }
                 .into(),
                 ..Default::default()
@@ -7084,6 +9323,8 @@ mod session_tests {
             Duration::from_secs(1),
             handle(
                 &api,
+                &crate::made_for_you::MadeForYou::new(crate::http::Http::default()),
+                &crate::new_releases::NewReleases::new(crate::http::Http::default()),
                 &crate::sonos::Controller::default(),
                 None,
                 &background_session,
@@ -7099,7 +9340,42 @@ mod session_tests {
                 result: Err(ApiError::NotSignedIn)
             }
         ));
-        assert_eq!(expired, None);
+        assert!(expired.is_empty());
+    }
+
+    /// Related artists are read over the session first, and a session error
+    /// keeps the Web API fallback.
+    #[test]
+    fn related_artists_can_bypass_the_shared_web_api() {
+        let api = ApiGateway::new(reqwest::Client::new(), Arc::new(NetActivity::default()));
+        let request = ApiRequest::RelatedArtists {
+            id: "artist1".into(),
+        };
+        assert!(
+            api.session_serves(operation_for(&api, &request)),
+            "a playback session must serve related artists before Shared quota"
+        );
+        assert!(
+            session_read(&request).is_some(),
+            "the eligible request needs a real session read"
+        );
+        assert_eq!(operation_for(&api, &request), Operation::RelatedArtists);
+        assert_eq!(
+            session_read(&request),
+            Some(SessionRead::RelatedArtists { id: "artist1" })
+        );
+        assert!(matches!(
+            session_response(&request, SessionAnswer::RelatedArtists(Ok(Vec::new()))),
+            Some(ApiResponse::RelatedArtists { id, result: Ok(artists) })
+                if id == "artist1" && artists.is_empty()
+        ));
+        assert!(
+            settle(Err::<Vec<Artist>, Failure>(Failure::Retry(
+                anyhow::anyhow!("private read unavailable")
+            )))
+            .is_none(),
+            "a transient session error must retain Web API fallback"
+        );
     }
 
     /// Popular-track responses retain artist identity and the existing fallback/error policy.
@@ -7139,6 +9415,34 @@ mod session_tests {
                 ..
             })
         ));
+    }
+
+    /// The session reads the library whole, so its answer to any page of a
+    /// load is the whole list from the top, with nothing after it (#698).
+    #[test]
+    fn the_session_answers_any_library_page_with_the_whole_list() {
+        let listed = |id: &str| Playlist {
+            id: id.into(),
+            ..Playlist::default()
+        };
+        for offset in [0, 50] {
+            let request = ApiRequest::MyPlaylists {
+                offset,
+                generation: 7,
+            };
+            assert_eq!(session_read(&request), Some(SessionRead::Library));
+            let answer = SessionAnswer::Library(Ok(vec![listed("a"), listed("b")]));
+            let Some(ApiResponse::MyPlaylists {
+                offset: 0,
+                generation: 7,
+                result: Ok(page),
+            }) = session_response(&request, answer)
+            else {
+                panic!("expected the whole library from the top");
+            };
+            assert_eq!(page.items.len(), 2);
+            assert_eq!((page.total, page.next_offset()), (2, None));
+        }
     }
 
     /// The session answers only for the account the Web API verified.
@@ -7219,7 +9523,7 @@ mod session_tests {
     #[test]
     fn a_session_answer_carries_the_requests_identity() {
         let rows = || SessionAnswer::Rows(Ok(Page::default()));
-        let header = || SessionAnswer::Header(Ok(Playlist::default()));
+        let header = || SessionAnswer::Header(Box::new(Ok(Playlist::default())));
         let items = ApiRequest::PlaylistItems {
             id: "pl1".into(),
             offset: 150,
@@ -7307,6 +9611,87 @@ mod cover_routing_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Avoids shared playlist search after a successful session read.
+    #[tokio::test]
+    async fn made_for_you_uses_shared_search_only_after_session_failure() {
+        let session_playlist = Playlist {
+            id: "session".into(),
+            ..Default::default()
+        };
+        let (result, personalized, expired) =
+            with_shared_made_for_you_fallback(Ok(vec![session_playlist.clone()]), || async {
+                panic!("the successful session must not search")
+            })
+            .await;
+        assert_eq!(result.unwrap(), vec![session_playlist]);
+        assert!(personalized);
+        assert!(expired.is_empty());
+
+        let (result, personalized, expired) =
+            with_shared_made_for_you_fallback(Err(ApiError::RateLimited), || async {
+                Ok(vec![Playlist {
+                    id: "shared".into(),
+                    ..Default::default()
+                }])
+            })
+            .await;
+        assert_eq!(result.unwrap()[0].id, "shared");
+        assert!(!personalized);
+        assert!(expired.is_empty());
+    }
+
+    /// A successful shared fallback must not conceal a rejected personal grant.
+    #[tokio::test]
+    async fn made_for_you_preserves_expiration_across_fallback_results() {
+        for fallback_error in [None, Some(ApiSource::Shared), Some(ApiSource::Personal)] {
+            let (result, personalized, expired) = with_shared_made_for_you_fallback(
+                Err(ApiError::SignInExpired {
+                    api_source: ApiSource::Personal,
+                }),
+                || async {
+                    match fallback_error {
+                        Some(api_source) => Err(ApiError::SignInExpired { api_source }),
+                        None => Ok(Vec::new()),
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), fallback_error.is_none());
+            assert!(!personalized);
+            assert_eq!(
+                expired,
+                if fallback_error == Some(ApiSource::Shared) {
+                    vec![ApiSource::Personal, ApiSource::Shared]
+                } else {
+                    vec![ApiSource::Personal]
+                }
+            );
+        }
+    }
+
+    /// Limits fallback results to Spotify-owned lists with playable contexts.
+    #[test]
+    fn shared_suggestions_are_spotify_owned_and_exclude_dj() {
+        let mut playlist = Playlist {
+            name: "Daily Mix 3".into(),
+            uri: "spotify:playlist:mix".into(),
+            ..Default::default()
+        };
+        playlist.owner.id = Some("spotify".into());
+        assert!(shared_made_for_you_match(&playlist, "Daily Mix"));
+        playlist.name = "Daily Mix Party".into();
+        assert!(!shared_made_for_you_match(&playlist, "Daily Mix"));
+        playlist.name = "Daily Mix 3".into();
+        playlist.owner.id = Some("other".into());
+        playlist.owner.display_name = Some("Spotify".into());
+        assert!(!shared_made_for_you_match(&playlist, "Daily Mix"));
+        playlist.owner.id = None;
+        assert!(!shared_made_for_you_match(&playlist, "Daily Mix"));
+        playlist.owner.id = Some("spotify".into());
+        playlist.uri = UNSUPPORTED_DJ_URI.into();
+        assert!(!shared_made_for_you_match(&playlist, "Daily Mix"));
+    }
 
     #[tokio::test]
     async fn connect_shuffle_play_waits_for_shuffle_before_starting_playback() {

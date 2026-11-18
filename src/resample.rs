@@ -53,6 +53,18 @@ impl Resampler {
         })
     }
 
+    /// Moves to a new ratio and keeps the input still in reach, so a rate
+    /// that changes as it plays carries on without a gap or a dip.
+    pub fn retune(&mut self, from_hz: u32, to_hz: u32) {
+        let divisor = gcd(from_hz, to_hz);
+        let up = (to_hz / divisor) as usize;
+        // The same place between input frames, in the new phase's steps.
+        self.phase = self.phase * up / self.up;
+        self.up = up;
+        self.down = (from_hz / divisor) as usize;
+        self.taps = kernel(self.up, self.down);
+    }
+
     /// Converts a chunk of interleaved frames. The output is what the
     /// input so far allows; the last few frames wait for the next chunk.
     pub fn process(&mut self, samples: &[f32]) -> Vec<f32> {

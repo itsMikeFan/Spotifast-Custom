@@ -341,7 +341,7 @@ pub fn shared() -> SharedEq {
 
 /// A second-order section in direct form I, one per band and channel.
 #[derive(Clone, Copy, Debug, Default)]
-struct Biquad {
+pub(crate) struct Biquad {
     b0: f64,
     b1: f64,
     b2: f64,
@@ -375,6 +375,36 @@ impl Biquad {
         }
     }
 
+    /// A low shelf after the Audio EQ Cookbook, at its steepest slope
+    /// without overshoot (S = 1), normalised by `a0`.
+    pub(crate) fn low_shelf(hz: f64, gain_db: f64) -> Self {
+        let a = 10f64.powf(gain_db / 40.0);
+        let w0 = std::f64::consts::TAU * hz / f64::from(SAMPLE_RATE);
+        let (sin, cos) = w0.sin_cos();
+        let shelf = a.sqrt() * sin * std::f64::consts::SQRT_2;
+        let a0 = (a + 1.0) + (a - 1.0) * cos + shelf;
+        Self {
+            b0: a * ((a + 1.0) - (a - 1.0) * cos + shelf) / a0,
+            b1: 2.0 * a * ((a - 1.0) - (a + 1.0) * cos) / a0,
+            b2: a * ((a + 1.0) - (a - 1.0) * cos - shelf) / a0,
+            a1: -2.0 * ((a - 1.0) + (a + 1.0) * cos) / a0,
+            a2: ((a + 1.0) + (a - 1.0) * cos - shelf) / a0,
+            ..Self::default()
+        }
+    }
+
+    /// `next`'s response carrying on from what this filter has played, so
+    /// a change mid-song does not click.
+    pub(crate) fn retuned(&self, next: Self) -> Self {
+        Self {
+            x1: self.x1,
+            x2: self.x2,
+            y1: self.y1,
+            y2: self.y2,
+            ..next
+        }
+    }
+
     /// The filter's gain at a frequency, in decibels, from its transfer
     /// function on the unit circle: what is played, including the bend
     /// the bilinear transform puts near the top of the band.
@@ -390,7 +420,7 @@ impl Biquad {
     }
 
     #[inline]
-    fn run(&mut self, x: f64) -> f64 {
+    pub(crate) fn run(&mut self, x: f64) -> f64 {
         let y = self.b0 * x + self.b1 * self.x1 + self.b2 * self.x2
             - self.a1 * self.y1
             - self.a2 * self.y2;

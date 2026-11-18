@@ -198,7 +198,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let width = ui.available_width();
     let mut window_controls = super::window_controls_reservation(
         ui.ctx(),
-        app.show_queue_panel,
+        app.show_queue_panel || app.show_friends_panel,
         app.show_lyrics_panel,
         width,
     );
@@ -210,9 +210,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // Where the titlebar used to be: the bar grows upwards into that space and
     // its empty parts drag the window.
     let inset = theme::titlebar_inset(ui.ctx());
-    let content_height = theme::TOP_BAR_HEIGHT + inset;
-    if crate::window::custom_titlebar() {
-        super::titlebar_drag(
+    let content_height = theme::top_bar_height() + inset;
+    if fastframe_titlebar::enabled() {
+        fastframe_titlebar::drag(
             ui,
             egui::Rect::from_min_size(
                 ui.cursor().min,
@@ -220,9 +220,16 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             ),
         );
     }
-    ui.add_space(window_controls.topbar_top);
+    // Balance the visible Windows header, including the gap below the
+    // control row.
+    let top_padding = if cfg!(windows) && fastframe_titlebar::enabled() {
+        4.0
+    } else {
+        0.0
+    };
+    ui.add_space(window_controls.topbar_top + top_padding);
     ui.allocate_ui_with_layout(
-        vec2(width, content_height),
+        vec2(width, content_height - top_padding),
         Layout::left_to_right(Align::Center),
         |ui| {
             ui.add_space(super::widgets::PAGE_PADDING);
@@ -275,7 +282,12 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
 
             // The badges sit at the right end but grow with their text, so
             // measure them here, before the search field takes its share.
-            let device_galley = app.now_playing().filter(|now| !now.local).map(|now| {
+            let remote_now = app.now_playing().filter(|now| !now.local);
+            let device_icon = remote_now
+                .as_ref()
+                .and_then(|now| now.device_kind.as_deref())
+                .map_or(Icon::Speaker, crate::ui::devices::device_icon);
+            let device_galley = remote_now.map(|now| {
                 let label = match now.device_name {
                     Some(device) => {
                         // Translators: {device} is the name of the device playing the music.
@@ -384,7 +396,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     .map(|user| {
                         (
                             user.name().to_string(),
-                            pick_image(&user.images, 64).map(str::to_string),
+                            pick_image(&user.images, app.art_px(28.0)).map(str::to_string),
                         )
                     })
                     .unwrap_or_default();
@@ -434,23 +446,26 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     .show(|ui| {
                         ui.set_width(200.0);
                         ui.add_space(4.0);
+                        // The plan sits right under the name, as one block:
+                        // a row of its own each would put a control's height
+                        // between them (#1038).
                         ui.horizontal(|ui| {
                             ui.add_space(10.0);
-                            theme::text(ui, &name, theme::semibold(14.0), palette.text);
-                        });
-                        if let Some(product) =
-                            app.user.as_ref().and_then(|user| user.product.clone())
-                        {
-                            ui.horizontal(|ui| {
-                                ui.add_space(10.0);
-                                theme::text(
-                                    ui,
-                                    capitalize(&product),
-                                    theme::regular(12.0),
-                                    palette.secondary,
-                                );
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                theme::text(ui, &name, theme::semibold(14.0), palette.text);
+                                if let Some(product) =
+                                    app.user.as_ref().and_then(|user| user.product.clone())
+                                {
+                                    theme::text(
+                                        ui,
+                                        capitalize(&product),
+                                        theme::regular(12.0),
+                                        palette.secondary,
+                                    );
+                                }
                             });
-                        }
+                        });
                         super::widgets::menu_separator(ui, &palette);
                         if super::widgets::menu_item(
                             ui,
@@ -574,7 +589,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                     let response = badge(
                         ui,
                         &palette,
-                        Icon::Speaker,
+                        device_icon,
                         galley,
                         DEVICE_BADGE_PADDING,
                         fit.labels,
