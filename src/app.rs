@@ -570,6 +570,8 @@ pub struct App {
     /// answers too, so an older disk cache cannot make a song unavailable
     /// again after the Web API has confirmed it can play.
     playlist_availability: HashMap<String, bool>,
+    /// Songs already sent for an availability check over the session.
+    availability_checked: HashSet<String>,
     /// Recording identities for which at least one known URI is saved.
     saved_recordings: HashSet<String>,
     /// Optimistic library writes that a stale contains response must not undo.
@@ -1219,6 +1221,7 @@ impl App {
             track_recordings: HashMap::new(),
             recording_uris: HashMap::new(),
             playlist_availability: HashMap::new(),
+            availability_checked: HashSet::new(),
             saved_recordings: HashSet::new(),
             saved_writes: HashMap::new(),
             accents: HashMap::new(),
@@ -3128,6 +3131,7 @@ impl App {
         self.track_recordings.clear();
         self.recording_uris.clear();
         self.playlist_availability.clear();
+        self.availability_checked.clear();
         self.saved_recordings.clear();
         self.saved_writes.clear();
         self.queue = Loadable::NotLoaded;
@@ -7309,6 +7313,25 @@ impl App {
                 }
                 self.home.new_release_tracks.refresh(result);
             }
+            ApiResponse::TrackAvailability { checked, result } => match result {
+                Ok(unavailable) => {
+                    for uri in unavailable {
+                        self.playlist_availability.insert(uri, false);
+                    }
+                    for page in self.playlist_pages.values_mut() {
+                        if fill_availability(&self.playlist_availability, &mut page.items.items) {
+                            page.items.revision = page.items.revision.wrapping_add(1);
+                            page.cache_append_valid = false;
+                        }
+                    }
+                }
+                Err(error) => {
+                    log::warn!("could not check which songs play: {error}");
+                    for uri in checked {
+                        self.availability_checked.remove(&uri);
+                    }
+                }
+            },
             ApiResponse::HiddenSongs { generation, result } => {
                 if generation != self.hidden_songs_generation {
                     return;
@@ -10623,6 +10646,36 @@ impl App {
         self.actions.push(Action::RestartEngine);
     }
 
+    /// Asks the session which of a loaded playlist's songs this account
+    /// cannot play: the Web API does not say, so Spotify greys out songs
+    /// that looked playable here until playback refused them.
+    fn check_availability(&mut self, id: &str) {
+        let Some(page) = self.playlist_pages.get_mut(id) else {
+            return;
+        };
+        if !self.local_ready {
+            // Ask again once the session is up.
+            page.availability_checked_at = None;
+            return;
+        }
+        let mut uris = Vec::new();
+        for item in &page.items.items {
+            if let Some(PlayableItem::Track(track)) = item.playable()
+                && !track.is_local
+                && track.is_playable.is_none()
+                && track.uri.starts_with("spotify:track:")
+                && self.availability_checked.insert(track.uri.clone())
+            {
+                uris.push(track.uri.clone());
+            }
+        }
+        for chunk in uris.chunks(200) {
+            self.backend.api(ApiRequest::TrackAvailability {
+                uris: chunk.to_vec(),
+            });
+        }
+    }
+
     /// The folder the local files scan starts from; the localsongs folder
     /// is always read beside it.
     fn local_files_scan_folder(&self) -> std::path::PathBuf {
@@ -12737,6 +12790,7 @@ impl App {
             Action::ChooseLocalSongs { playlist, replaces } => {
                 self.backend.choose_local_songs(playlist, replaces);
             }
+            Action::CheckAvailability(id) => self.check_availability(&id),
             Action::RemoveLocalSong { playlist, uri } => {
                 if self.local_songs.remove(&playlist, &uri) {
                     self.save_local_songs();
@@ -30438,6 +30492,46 @@ mod tests {
             assert_eq!(load.offset_index, Some(0));
             assert!(load.uris.is_empty());
         }
+    }
+
+    /// Songs the session says this account cannot play are greyed out in
+    /// every loaded playlist; a failed check may be asked again.
+    #[test]
+    fn songs_the_session_cannot_play_are_greyed_out() {
+        let mut app = headless_app();
+        let rows = vec![
+            cached_playlist_row("spotify:track:gone"),
+            cached_playlist_row("spotify:track:fine"),
+        ];
+        app.playlist_pages.insert(
+            "p".into(),
+            PlaylistPage {
+                items: PagedList {
+                    items: rows,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        app.handle_api(ApiResponse::TrackAvailability {
+            checked: vec!["spotify:track:gone".into(), "spotify:track:fine".into()],
+            result: Ok(vec!["spotify:track:gone".into()]),
+        });
+        let playable =
+            |app: &App, index: usize| match app.playlist_pages["p"].items.items[index].playable() {
+                Some(PlayableItem::Track(track)) => track.is_playable,
+                _ => None,
+            };
+        assert_eq!(playable(&app, 0), Some(false));
+        assert_eq!(playable(&app, 1), None);
+
+        app.availability_checked
+            .insert("spotify:track:retry".into());
+        app.handle_api(ApiResponse::TrackAvailability {
+            checked: vec!["spotify:track:retry".into()],
+            result: Err(crate::api::ApiError::Network("down".into())),
+        });
+        assert!(!app.availability_checked.contains("spotify:track:retry"));
     }
 
     #[test]

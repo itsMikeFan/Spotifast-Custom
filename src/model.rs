@@ -847,6 +847,8 @@ pub struct PlaylistPage {
     pub filter: String,
     /// The page lists only the songs Spotify says are unavailable.
     pub unavailable_only: bool,
+    /// The rows' revision whose songs were last sent for an availability check.
+    pub availability_checked_at: Option<u64>,
     /// Contributor IDs from loaded pages and a sample of the final page.
     pub contributors: std::collections::BTreeSet<String>,
     /// Whether contributors were sampled from the final page.
@@ -1426,6 +1428,8 @@ pub enum Action {
         playlist: String,
         replaces: Option<String>,
     },
+    /// Ask which of a loaded playlist's songs this account cannot play.
+    CheckAvailability(String),
     /// Take the song from this PC `uri` out of `playlist`.
     RemoveLocalSong {
         playlist: String,

@@ -205,6 +205,10 @@ pub enum ApiRequest {
     HiddenSongs {
         generation: u64,
     },
+    /// Which of `uris` this account cannot play, over the playback session.
+    TrackAvailability {
+        uris: Vec<String>,
+    },
     /// Hide a song in one of Spotify's playlists, or show it again.
     SetHiddenInPlaylist {
         playlist_uri: String,
@@ -428,6 +432,7 @@ impl ApiRequest {
                 | Self::NewReleases { .. }
                 | Self::NewReleaseTracks { .. }
                 | Self::HiddenSongs { .. }
+                | Self::TrackAvailability { .. }
                 | Self::MyPlaylists { .. }
                 | Self::PlaylistSample { .. }
                 | Self::Contains { .. }
@@ -485,6 +490,11 @@ pub enum ApiResponse {
     HiddenSongs {
         generation: u64,
         result: ApiResult<Vec<(String, String)>>,
+    },
+    /// The songs among `checked` this account cannot play.
+    TrackAvailability {
+        checked: Vec<String>,
+        result: ApiResult<Vec<String>>,
     },
     HiddenInPlaylistSet {
         playlist_uri: String,
@@ -5018,9 +5028,9 @@ fn operation_for(api: &ApiGateway, request: &ApiRequest) -> Operation {
         }
         ApiRequest::NewReleases { .. } => Operation::UserData,
         ApiRequest::NewReleaseTracks { .. } => Operation::Catalog,
-        ApiRequest::HiddenSongs { .. } | ApiRequest::SetHiddenInPlaylist { .. } => {
-            Operation::UserData
-        }
+        ApiRequest::HiddenSongs { .. }
+        | ApiRequest::SetHiddenInPlaylist { .. }
+        | ApiRequest::TrackAvailability { .. } => Operation::UserData,
         ApiRequest::SearchCatalogue { .. } => Operation::CatalogSearch,
         ApiRequest::Search { .. } => Operation::PlaylistSearch,
         ApiRequest::PlaySearch { kind, .. } if kind == "playlist" => Operation::PlaylistSearch,
@@ -5445,6 +5455,24 @@ async fn handle(
             expired,
         );
     }
+    if let ApiRequest::TrackAvailability { uris } = request {
+        let result = match playback_session(api, engine) {
+            Ok(session) => {
+                let _permit = background_session.acquire().await.ok();
+                session_reads::unavailable_songs(session, &uris)
+                    .await
+                    .map_err(|error| ApiError::Network(format!("{error:#}")))
+            }
+            Err(error) => Err(error),
+        };
+        return (
+            ApiResponse::TrackAvailability {
+                checked: uris,
+                result,
+            },
+            Vec::new(),
+        );
+    }
     if let ApiRequest::HiddenSongs { generation } = request {
         let result = match playback_session(api, engine) {
             Ok(session) => {
@@ -5592,6 +5620,7 @@ async fn handle(
         | ApiRequest::NewReleases { .. }
         | ApiRequest::NewReleaseTracks { .. }
         | ApiRequest::HiddenSongs { .. }
+        | ApiRequest::TrackAvailability { .. }
         | ApiRequest::SetHiddenInPlaylist { .. } => unreachable!("handled before Web API routing"),
         ApiRequest::MyPlaylists { offset, generation } => ApiResponse::MyPlaylists {
             offset,
@@ -5608,17 +5637,7 @@ async fn handle(
             offset,
             generation,
         } => ApiResponse::PlaylistItems {
-            result: {
-                let mut result = routed!(playlist_items(&id, offset, PLAYLIST_PAGE_SIZE));
-                if let Ok(page) = &mut result
-                    && let Some(engine) = engine.filter(|engine| {
-                        same_account(&engine.session().username(), api.account().as_ref())
-                    })
-                {
-                    session_reads::mark_unavailable(engine.session(), &mut page.items).await;
-                }
-                result
-            },
+            result: routed!(playlist_items(&id, offset, PLAYLIST_PAGE_SIZE)),
             id,
             offset,
             generation,

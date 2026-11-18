@@ -1691,40 +1691,37 @@ async fn metadata_tolerating(
     Ok(playables)
 }
 
-/// Greys out the songs among `items` this account cannot play. The Web API
-/// says nothing of availability without a market, and asking it for one
-/// would swap songs for their relinked copies, so the session is asked.
-/// Best effort: a failed read leaves the rows as they are.
-pub async fn mark_unavailable(session: &Session, items: &mut [PlaylistItem]) {
-    let uris: Vec<SpotifyUri> = items
-        .iter()
-        .filter_map(|item| match item.playable()? {
-            PlayableItem::Track(track) if !track.is_local && track.is_playable.is_none() => {
-                SpotifyUri::from_uri(&track.uri).ok()
-            }
-            _ => None,
-        })
-        .collect();
-    let (request, asked) = batch(uris.iter());
-    if asked.is_empty() {
-        return;
-    }
-    let Ok(response) = session.spclient().get_extended_metadata(request).await else {
-        return;
-    };
+/// Which of `uris` this account cannot play. The Web API says nothing of
+/// availability without a market, and asking it for one would swap songs
+/// for their relinked copies, so the session is asked, 50 songs at a time.
+pub async fn unavailable_songs(session: &Session, uris: &[String]) -> anyhow::Result<Vec<String>> {
     let user = session.user_data();
     let catalogue = user
         .attributes
         .get("catalogue")
-        .map_or("premium", String::as_str);
-    let unavailable = unavailable_tracks(&response, &user.country, catalogue);
-    for item in items {
-        if let Some(PlayableItem::Track(track)) = item.item.as_mut().or(item.track.as_mut())
-            && unavailable.contains(&track.uri)
-        {
-            track.is_playable = Some(false);
+        .map_or("premium", String::as_str)
+        .to_string();
+    let mut unavailable = Vec::new();
+    for chunk in uris.chunks(50) {
+        let parsed: Vec<SpotifyUri> = chunk
+            .iter()
+            .filter_map(|uri| SpotifyUri::from_uri(uri).ok())
+            .collect();
+        let (request, asked) = batch(parsed.iter());
+        if asked.is_empty() {
+            continue;
         }
+        let response = session.spclient().get_extended_metadata(request).await?;
+        let found = unavailable_tracks(&response, &user.country, &catalogue);
+        log::info!(
+            "availability checked={} unavailable={} country={} catalogue={catalogue}",
+            asked.len(),
+            found.len(),
+            user.country
+        );
+        unavailable.extend(found);
     }
+    Ok(unavailable)
 }
 
 /// The songs in `response` this account cannot play, judged as librespot's
@@ -1757,6 +1754,21 @@ fn unavailable_tracks(
                 continue;
             };
             any_files |= !track.files.is_empty();
+            log::info!(
+                "availability {} files={} alternatives={} restrictions={:?}",
+                data.entity_uri,
+                track.files.len(),
+                track.alternatives.len(),
+                track
+                    .restrictions
+                    .iter()
+                    .map(|r| (
+                        &r.catalogue_strs,
+                        &r.countries_allowed,
+                        &r.countries_forbidden
+                    ))
+                    .collect::<Vec<_>>()
+            );
             let embargoed = now < track.earliest_live_timestamp
                 || (!track.availability.is_empty()
                     && !track.availability.iter().any(|window| now >= window.start));

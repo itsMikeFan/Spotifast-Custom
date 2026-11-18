@@ -1853,6 +1853,10 @@ pub fn playlist(app: &mut App, ui: &mut egui::Ui, id: &str) {
             } else {
                 items
             };
+            if page.availability_checked_at != Some(page.items.revision) {
+                page.availability_checked_at = Some(page.items.revision);
+                app.actions.push(Action::CheckAvailability(id.to_string()));
+            }
             let raw_rows = page.items.items.len();
             let server_rows = (page.items.total.unwrap_or(0) as usize).max(raw_rows);
             let complete = page.items.is_complete();
