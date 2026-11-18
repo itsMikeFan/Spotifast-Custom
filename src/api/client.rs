@@ -823,12 +823,17 @@ impl ApiClient {
         .map(Into::into)
     }
 
-    /// Requested songs already present in a playlist.
+    /// URIs of requested songs already present in a playlist, matched by
+    /// [`PlayableItem::song_key`] so a reupload of the same song counts.
     ///
     /// Spotify has no membership endpoint for playlists, so walk its pages
-    /// until every requested URI has been found or the playlist ends.
-    pub async fn playlist_duplicates(&self, id: &str, uris: &[String]) -> Result<Vec<String>> {
-        let wanted: HashSet<&str> = uris.iter().map(String::as_str).collect();
+    /// until every requested song has been found or the playlist ends.
+    pub async fn playlist_duplicates(
+        &self,
+        id: &str,
+        items: &[PlayableItem],
+    ) -> Result<Vec<String>> {
+        let wanted: HashSet<String> = items.iter().map(PlayableItem::song_key).collect();
         if wanted.is_empty() {
             return Ok(Vec::new());
         }
@@ -836,14 +841,14 @@ impl ApiClient {
         let mut offset = 0;
         loop {
             let page = self.playlist_items(id, offset, 50).await?;
-            for uri in page
+            for key in page
                 .items
                 .iter()
                 .filter_map(PlaylistItem::playable)
-                .map(PlayableItem::uri)
+                .map(PlayableItem::song_key)
             {
-                if wanted.contains(uri) {
-                    found.insert(uri.to_string());
+                if wanted.contains(&key) {
+                    found.insert(key);
                 }
             }
             if found.len() == wanted.len() {
@@ -854,11 +859,43 @@ impl ApiClient {
             };
             offset = next;
         }
-        Ok(uris
+        Ok(items
             .iter()
-            .filter(|uri| found.contains(uri.as_str()))
-            .cloned()
+            .filter(|item| found.contains(&item.song_key()))
+            .map(|item| item.uri().to_string())
             .collect())
+    }
+
+    /// Every row of a playlist in order; `None` where Spotify has no song.
+    pub async fn all_playlist_items(&self, id: &str) -> Result<Vec<Option<PlayableItem>>> {
+        let mut rows = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = self.playlist_items(id, offset, 50).await?;
+            rows.extend(page.items.iter().map(|row| row.playable().cloned()));
+            let Some(next) = page.next_offset() else {
+                return Ok(rows);
+            };
+            offset = next;
+        }
+    }
+
+    /// Removes every copy of `uris`, then puts back the copies to keep at
+    /// their final positions, in ascending order so each index is already right.
+    pub async fn remove_playlist_duplicates(
+        &self,
+        id: &str,
+        uris: &[String],
+        readd: &[(String, u32)],
+        snapshot_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let mut snapshot = self.remove_playlist_items(id, uris, snapshot_id).await?;
+        for (uri, position) in readd {
+            snapshot = self
+                .add_playlist_items(id, std::slice::from_ref(uri), Some(*position))
+                .await?;
+        }
+        Ok(snapshot)
     }
 
     pub async fn create_playlist(

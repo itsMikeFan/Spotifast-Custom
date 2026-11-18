@@ -235,7 +235,10 @@ alone instead of treating every following track as unavailable. This refusal
 comes from Spotify; trying again later may work.
 
 Before adding songs to an existing playlist, Spotifast checks the rows it
-already holds. A known duplicate produces an immediate confirmation naming the
+already holds, matching on song name and lead artist rather than track URI.
+**Find duplicates** reads every playlist page, then removes picked rows by
+removing each affected URI (Spotify removes all copies of a URI at once) and
+re-adding the kept copies at their positions. A known duplicate produces an immediate confirmation naming the
 song. Only a playlist that has not been fully loaded needs a background scan to
 rule out duplicates. Once confirmed, the new rows appear locally at once.
 Since 0.8.0,

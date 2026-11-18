@@ -57,6 +57,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 }
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
+                Dialog::PlaylistDuplicates { .. } => playlist_duplicates(app, ui),
                 Dialog::ConfirmDeletePlaylist { id, name, owned } => {
                     theme::text(
                         ui,
@@ -340,6 +341,132 @@ fn text_field(
         response.request_focus();
     }
     response
+}
+
+fn playlist_duplicates(app: &mut App, ui: &mut egui::Ui) {
+    let palette = app.palette;
+    let locale = app.locale;
+    let Some(Dialog::PlaylistDuplicates {
+        playlist_id,
+        playlist_name,
+        rows,
+        groups,
+        remove,
+    }) = &mut app.dialog
+    else {
+        return;
+    };
+    theme::text(
+        ui,
+        gettext(locale, "Duplicate songs"),
+        theme::bold(20.0),
+        palette.text,
+    );
+    ui.add_space(8.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(
+                // Translators: {playlist} is a playlist name.
+                gettext(
+                    locale,
+                    "Same song name and artist in “{playlist}”. Ticked rows will be removed.",
+                )
+                .replace("{playlist}", playlist_name),
+            )
+            .font(theme::regular(14.0))
+            .color(palette.secondary),
+        )
+        .wrap(),
+    );
+    ui.add_space(12.0);
+    let room = ui.ctx().content_rect().height() - 220.0;
+    egui::ScrollArea::vertical()
+        .max_height(room.max(120.0))
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            for group in groups.iter() {
+                let Some(first) = rows[group[0]].as_ref() else {
+                    continue;
+                };
+                theme::text(
+                    ui,
+                    format!("{} · {}", first.name(), first.subtitle()),
+                    theme::semibold(14.0),
+                    palette.text,
+                );
+                for &index in group {
+                    let Some(item) = rows[index].as_ref() else {
+                        continue;
+                    };
+                    let album = match item {
+                        crate::api::models::PlayableItem::Track(track) => track
+                            .album
+                            .as_ref()
+                            .map(|album| album.name.clone())
+                            .unwrap_or_default(),
+                        crate::api::models::PlayableItem::Episode(_) => String::new(),
+                    };
+                    let mut ticked = remove.contains(&index);
+                    let label = format!(
+                        "#{}  {}  {}",
+                        index + 1,
+                        album,
+                        crate::util::format_duration_ms(item.duration_ms())
+                    );
+                    if ui
+                        .checkbox(
+                            &mut ticked,
+                            egui::RichText::new(label)
+                                .font(theme::regular(13.0))
+                                .color(palette.secondary),
+                        )
+                        .changed()
+                    {
+                        if ticked {
+                            remove.insert(index);
+                        } else {
+                            remove.remove(&index);
+                        }
+                    }
+                }
+                ui.add_space(10.0);
+            }
+        });
+    ui.add_space(16.0);
+    let count = remove.len();
+    let mut confirmed = false;
+    buttons(ui, |ui| {
+        let label = ngettext(
+            locale,
+            "Remove {count} song",
+            "Remove {count} songs",
+            count as u32,
+        )
+        .replace("{count}", &count.to_string());
+        confirmed = ui
+            .add_enabled_ui(count > 0, |ui| {
+                theme::pill_button(ui, &palette, &label, true)
+            })
+            .inner
+            .clicked();
+        if theme::pill_button(ui, &palette, &gettext(locale, "Cancel"), false).clicked() {
+            app.actions.push(Action::CloseDialog);
+        }
+    });
+    if confirmed {
+        app.actions.push(Action::RemovePlaylistDuplicates {
+            playlist_id: playlist_id.clone(),
+            rows: rows
+                .iter()
+                .map(|row| {
+                    row.as_ref()
+                        .map(|item| item.uri().to_string())
+                        .unwrap_or_default()
+                })
+                .collect(),
+            remove: remove.clone(),
+        });
+    }
 }
 
 fn create_playlist(app: &mut App, ui: &mut egui::Ui) {
