@@ -474,9 +474,9 @@ wave as a glowing line. With **Colour from album art** on, both sweep from
 bass to treble across up to four colours read from the cover, its hues first
 and its greys after, so a black and white cover moves in grey; with it off,
 they take the accent colour. It follows the equalizer, not the volume, and moves only while the
-song plays on this computer. It is off by default. Clicking the player
-bar's empty space switches it, as Winamp's visualizer did: off, then
-Spectrum, then Waveform, then off again. **Frame rate** in **Settings >
+song plays on this computer. It is off by default. Right-click the player
+bar's empty space for a menu that picks Spectrum, Waveform or Off and
+sets one colour of your own in place of the cover's; a plain click does nothing. **Frame rate** in **Settings >
 Appearance** sets how often it and the mini player's analyser draw: 30, 60
 (the default), the rate of the screen showing the window, or Uncapped,
 which follows the display. They draw at half that rate while Spotifast's

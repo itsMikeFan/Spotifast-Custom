@@ -63,9 +63,9 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
             if visualizer(app, ui, behind, now.as_ref()) {
                 theme::visualiser_frame(ui.ctx(), app.visualiser_fps());
             }
-            // Its empty space is the visualizer's control, as Winamp's
-            // visualizer was: a click moves to the next mode. The controls
-            // drawn after it take their own clicks.
+            // A right-click on its empty space opens the visualizer's style
+            // and colour menu; a plain click does nothing, so a stray click
+            // never changes it. The controls drawn after take their own clicks.
             if app.settings.player_bar_vis_click {
                 let empty = ui.interact(
                     behind,
@@ -78,14 +78,15 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
                 let empty = if empty.hovered() {
                     empty.on_hover_text_at_pointer(gettext(
                         app.locale,
-                        "Click to change the visualizer",
+                        "Right-click for visualizer options",
                     ))
                 } else {
                     empty
                 };
-                if empty.clicked() {
-                    app.actions.push(Action::CyclePlayerBarVis);
-                }
+                egui::Popup::context_menu(&empty)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .frame(super::widgets::menu_frame(&palette))
+                    .show(|ui| visualizer_menu(app, ui));
             }
             ui.painter().hline(
                 rect.x_range(),
@@ -130,7 +131,11 @@ fn visualizer(app: &mut App, ui: &egui::Ui, rect: Rect, now: Option<&NowPlaying>
     let mode = app.settings.player_bar_vis;
     let sounding = now.is_some_and(|now| (now.playing || now.loading) && now.local);
     let dark = ui.visuals().dark_mode;
-    let colours = vis_colours(app.now_playing_palette(), app.palette.accent, dark);
+    // A chosen colour is still kept to the band the bar's words read against.
+    let colours = match app.settings.player_bar_vis_colour {
+        Some([r, g, b]) => vec![within_brightness(Color32::from_rgb(r, g, b), dark)],
+        None => vis_colours(app.now_playing_palette(), app.palette.accent, dark),
+    };
     // Over a light bar the same colour paints more strongly, or white
     // would wash it out.
     let strength = if dark { 1.0 } else { LIGHT_STRENGTH };
@@ -169,6 +174,52 @@ fn visualizer(app: &mut App, ui: &egui::Ui, rect: Rect, now: Option<&NowPlaying>
             );
             true
         }
+    }
+}
+
+/// The player bar's right-click menu: the visualizer's style, and either the
+/// album art's colours or one of the user's own.
+fn visualizer_menu(app: &mut App, ui: &mut egui::Ui) {
+    use super::widgets::{menu_item, menu_separator};
+    use crate::settings::PlayerBarVis;
+    let palette = app.palette;
+    let locale = app.locale;
+    let check = |on: bool| on.then_some(Icon::Check);
+    ui.set_width(220.0);
+    for (mode, label) in [
+        (PlayerBarVis::Spectrum, "Spectrum"),
+        (PlayerBarVis::Waveform, "Waveform"),
+        (PlayerBarVis::Off, "Off"),
+    ] {
+        let chosen = app.settings.player_bar_vis == mode;
+        if menu_item(ui, &palette, check(chosen), &gettext(locale, label)) && !chosen {
+            app.actions.push(Action::SetPlayerBarVis(mode));
+        }
+    }
+    menu_separator(ui, &palette);
+    let own = app.settings.player_bar_vis_colour;
+    if menu_item(
+        ui,
+        &palette,
+        check(own.is_none()),
+        &gettext(locale, "Colours from album art"),
+    ) && own.is_some()
+    {
+        app.actions.push(Action::SetPlayerBarVisColour(None));
+    }
+    // Always shown, since a menu item's click closes the menu: picking a
+    // colour here is what turns the album art's colours off.
+    ui.label(gettext(locale, "Custom colour"));
+    let [r, g, b] = own.unwrap_or([palette.accent.r(), palette.accent.g(), palette.accent.b()]);
+    let mut colour = Color32::from_rgb(r, g, b);
+    ui.spacing_mut().slider_width = 180.0;
+    if egui::color_picker::color_picker_color32(ui, &mut colour, egui::color_picker::Alpha::Opaque)
+    {
+        app.actions.push(Action::SetPlayerBarVisColour(Some([
+            colour.r(),
+            colour.g(),
+            colour.b(),
+        ])));
     }
 }
 

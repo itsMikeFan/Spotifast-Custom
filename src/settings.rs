@@ -89,18 +89,6 @@ pub enum PlayerBarVis {
     Waveform,
 }
 
-impl PlayerBarVis {
-    /// The mode a click on the player bar moves to: spectrum, waveform,
-    /// then off, as Winamp's visualizer cycles.
-    pub fn next(self) -> Self {
-        match self {
-            Self::Off => Self::Spectrum,
-            Self::Spectrum => Self::Waveform,
-            Self::Waveform => Self::Off,
-        }
-    }
-}
-
 /// Mini-player visualizer mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -313,8 +301,12 @@ pub struct Settings {
     pub accent_from_art: bool,
     /// A spectrum or waveform of the playing song behind the player bar.
     pub player_bar_vis: PlayerBarVis,
-    /// Allow clicks on the player bar background to cycle visualizer modes.
+    /// Allow a right-click on the player bar background to open the
+    /// visualizer's style and colour menu.
     pub player_bar_vis_click: bool,
+    /// The player bar visualizer's own colour; none follows the album art.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub player_bar_vis_colour: Option<[u8; 3]>,
     /// How many frames a second the player bar's visualizer and the mini
     /// player's analyser draw; 0 is uncapped. MilkDrop has its own.
     pub visualizer_fps: u32,
@@ -512,6 +504,7 @@ impl Default for Settings {
             accent_from_art: true,
             player_bar_vis: PlayerBarVis::Off,
             player_bar_vis_click: true,
+            player_bar_vis_colour: None,
             visualizer_fps: crate::milkdrop::DEFAULT_FPS,
             volume: (u16::MAX as u32 * 70 / 100) as u16,
             sidebar_visible: true,
@@ -1543,9 +1536,14 @@ mod tests {
         }
         let spectrum: Settings = serde_json::from_str(r#"{"player_bar_vis":"spectrum"}"#).unwrap();
         assert_eq!(spectrum.player_bar_vis, PlayerBarVis::Spectrum);
-        assert_eq!(PlayerBarVis::Off.next(), PlayerBarVis::Spectrum);
-        assert_eq!(PlayerBarVis::Spectrum.next(), PlayerBarVis::Waveform);
-        assert_eq!(PlayerBarVis::Waveform.next(), PlayerBarVis::Off);
+        assert_eq!(spectrum.player_bar_vis_colour, None);
+        let coloured = Settings {
+            player_bar_vis_colour: Some([255, 0, 128]),
+            ..Settings::default()
+        };
+        let json = serde_json::to_string(&coloured).unwrap();
+        let restored: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.player_bar_vis_colour, Some([255, 0, 128]));
     }
 
     #[test]

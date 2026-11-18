@@ -12394,8 +12394,12 @@ impl App {
             // The same request the window's own close button makes, so the
             // close-to-tray setting decides what follows.
             Action::CloseWindow => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
-            Action::CyclePlayerBarVis => {
-                self.settings.player_bar_vis = self.settings.player_bar_vis.next();
+            Action::SetPlayerBarVis(mode) => {
+                self.settings.player_bar_vis = mode;
+                self.settings_dirty = true;
+            }
+            Action::SetPlayerBarVisColour(colour) => {
+                self.settings.player_bar_vis_colour = colour;
                 self.settings_dirty = true;
             }
             Action::CycleVisualiser => {

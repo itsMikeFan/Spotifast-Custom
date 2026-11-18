@@ -5311,11 +5311,8 @@ mod tests {
             pointer_click(beside, egui::PointerButton::Primary),
             view,
         );
-        assert!(
-            matches!(app.actions.as_slice(), [Action::CyclePlayerBarVis]),
-            "{:?}",
-            app.actions
-        );
+        // A stray left-click no longer changes the visualizer.
+        assert!(app.actions.is_empty(), "{:?}", app.actions);
 
         app.actions.clear();
         view_frame(
@@ -5328,6 +5325,20 @@ mod tests {
             matches!(app.actions.as_slice(), [Action::Open(Page::Artist(id))] if id == "short"),
             "{:?}",
             app.actions
+        );
+
+        // A right-click there opens the visualizer's menu.
+        app.actions.clear();
+        view_frame(
+            &ctx,
+            &mut app,
+            pointer_click(beside, egui::PointerButton::Secondary),
+            view,
+        );
+        let shown = view_frame(&ctx, &mut app, vec![], view);
+        assert!(
+            shown.iter().any(|(text, _)| text == "Custom colour"),
+            "{shown:?}"
         );
         app.backend.shutdown();
     }
@@ -5704,12 +5715,13 @@ mod tests {
         app.backend.shutdown();
     }
 
-    /// A click on the player bar's empty space moves the visualizer to its
-    /// next mode, and a click on a control does not.
+    /// A left-click on the player bar's empty space changes nothing; a
+    /// right-click opens the visualizer's menu, whose entries set the style
+    /// and colour.
     #[cfg(feature = "demo")]
     #[test]
-    fn clicking_the_player_bars_empty_space_cycles_the_visualizer() {
-        let (ctx, mut app) = accessible_app("player-bar-cycle");
+    fn right_clicking_the_player_bars_empty_space_opens_the_visualizer_menu() {
+        let (ctx, mut app) = accessible_app("player-bar-vis-menu");
         let draw = |app: &mut App, events: Vec<egui::Event>| {
             let mut output = ctx.run_ui(
                 egui::RawInput {
@@ -5723,35 +5735,66 @@ mod tests {
                 |ui| crate::ui::player_bar::show(app, ui),
             );
             output.textures_delta.clear();
+            menu_text(&output)
         };
         draw(&mut app, vec![]);
         // The margin at the bar's left edge, beside the cover.
         let empty = egui::pos2(6.0, 796.0);
         draw(&mut app, pointer_click(empty, egui::PointerButton::Primary));
+        assert!(app.actions.is_empty(), "{:?}", app.actions);
+
+        draw(
+            &mut app,
+            pointer_click(empty, egui::PointerButton::Secondary),
+        );
+        let menu = draw(&mut app, vec![]);
+        let at = |label: &str| {
+            menu.iter()
+                .find(|(text, _)| text == label)
+                .unwrap_or_else(|| panic!("{label} missing from {menu:?}"))
+                .1
+                .center()
+        };
+        at("Custom colour");
+        let waveform = at("Waveform");
+
+        draw(
+            &mut app,
+            pointer_click(waveform, egui::PointerButton::Primary),
+        );
         assert!(
+            matches!(
+                app.actions.as_slice(),
+                [Action::SetPlayerBarVis(
+                    crate::settings::PlayerBarVis::Waveform
+                )]
+            ),
+            "{:?}",
             app.actions
-                .iter()
-                .any(|action| matches!(action, Action::CyclePlayerBarVis))
         );
-
+        // With a colour of its own, the menu's first colour entry goes back
+        // to the album art's.
         app.actions.clear();
-        app.settings.player_bar_vis_click = false;
-        draw(&mut app, pointer_click(empty, egui::PointerButton::Primary));
-        assert!(
-            !app.actions
-                .iter()
-                .any(|action| matches!(action, Action::CyclePlayerBarVis))
+        app.settings.player_bar_vis_colour = Some([255, 0, 128]);
+        // One frame for the closed menu to leave the spot it covered.
+        draw(&mut app, vec![]);
+        draw(
+            &mut app,
+            pointer_click(empty, egui::PointerButton::Secondary),
         );
-        app.settings.player_bar_vis_click = true;
-
-        // The play button, in the middle of the bar, is still the play button.
-        app.actions.clear();
-        let play = egui::pos2(640.0, 800.0 - crate::theme::PLAYER_BAR_HEIGHT / 2.0 - 10.0);
-        draw(&mut app, pointer_click(play, egui::PointerButton::Primary));
+        let menu = draw(&mut app, vec![]);
+        let art = menu
+            .iter()
+            .find(|(text, _)| text == "Colours from album art")
+            .unwrap_or_else(|| panic!("{menu:?}"))
+            .1
+            .center();
+        draw(&mut app, pointer_click(art, egui::PointerButton::Primary));
         assert!(
-            !app.actions
-                .iter()
-                .any(|action| matches!(action, Action::CyclePlayerBarVis)),
+            matches!(
+                app.actions.as_slice(),
+                [Action::SetPlayerBarVisColour(None)]
+            ),
             "{:?}",
             app.actions
         );
@@ -5797,7 +5840,7 @@ mod tests {
                 .for_each(|clipped| texts(&clipped.shape, &mut found));
             found
         };
-        let tip = "Click to change the visualizer";
+        let tip = "Right-click for visualizer options";
 
         // #given the tooltip shown over the empty margin beside the cover
         let empty = egui::pos2(6.0, 796.0);

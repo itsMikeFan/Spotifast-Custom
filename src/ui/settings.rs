@@ -1108,7 +1108,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     let custom_titlebar = gettext(locale, "Custom title bar");
     let show_custom_titlebar = cfg!(target_os = "linux") || app.windows_controls_visible();
     let player_bar_vis = gettext(locale, "Player bar visualizer");
-    let player_bar_vis_click = gettext(locale, "Click player bar to change visualizer");
+    let player_bar_vis_click = gettext(locale, "Right-click player bar for visualizer options");
     // Follow system's own light and dark palettes. Omarchy's palette already
     // follows the desktop, so they are offered only without it.
     let show_pair = app.settings.custom_theme.is_none()
@@ -1213,7 +1213,7 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
         ),
         RowText::new(
             player_bar_vis_click.clone(),
-            gettext(locale, "Allow clicks on empty player bar space to cycle the visualizer."),
+            gettext(locale, "Right-click empty player bar space to choose the visualizer style and colour."),
         ),
         RowText::new(
             gettext(locale, "Frame rate"),
