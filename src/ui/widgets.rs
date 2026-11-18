@@ -1150,18 +1150,31 @@ fn item_menu_at(
                     uri: uri.clone(),
                 });
             }
-        } else if crate::ui::collection::is_unavailable(item)
-            && menu_item(
+        } else if let PlayableItem::Track(track) = item
+            && crate::ui::collection::is_unavailable(item)
+        {
+            if menu_item(
+                ui,
+                &palette,
+                Some(Icon::Search),
+                &gettext(locale, "Find on YouTube…"),
+            ) {
+                app.actions.push(Action::FindOnYoutube {
+                    playlist: playlist.clone(),
+                    track: Box::new(track.clone()),
+                });
+            }
+            if menu_item(
                 ui,
                 &palette,
                 Some(Icon::ListPlus),
                 &gettext(locale, "Replace with a song from this PC…"),
-            )
-        {
-            app.actions.push(Action::ChooseLocalSongs {
-                playlist,
-                replaces: Some(uri.clone()),
-            });
+            ) {
+                app.actions.push(Action::ChooseLocalSongs {
+                    playlist,
+                    replaces: Some(uri.clone()),
+                });
+            }
         }
     }
     menu_separator(ui, &palette);

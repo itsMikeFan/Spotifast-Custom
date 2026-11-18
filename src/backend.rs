@@ -777,6 +777,24 @@ pub enum Command {
     /// Find the songs in the local files folder, off the UI thread, as the
     /// player does when it starts.
     ScanLocalFiles(std::path::PathBuf),
+    InstallYoutubeTools {
+        request: u64,
+    },
+    SearchYoutube {
+        request: u64,
+        title: String,
+        artist: String,
+        duration_ms: u32,
+    },
+    /// Save video `id` as an MP3 in the localsongs folder, tagged as the
+    /// Spotify song, and read the URI it plays by.
+    DownloadFromYoutube {
+        request: u64,
+        id: String,
+        title: String,
+        artist: String,
+        album: String,
+    },
     /// Copy the picked files into the localsongs folder for `playlist`.
     ImportLocalSongs {
         playlist: String,
@@ -1014,6 +1032,19 @@ pub struct LyricsRequest {
 }
 
 pub enum Event {
+    YoutubeToolsInstalled {
+        request: u64,
+        result: Result<(), String>,
+    },
+    YoutubeFound {
+        request: u64,
+        result: Result<crate::youtube::Found, String>,
+    },
+    /// The downloaded song's `spotify:local:` URI, or why it failed.
+    YoutubeDownloaded {
+        request: u64,
+        result: Result<String, String>,
+    },
     /// Files copied into the localsongs folder for `playlist`, each as the
     /// `spotify:local:` URI it plays by, or why it could not be.
     LocalSongsImported {
@@ -2322,6 +2353,47 @@ impl Worker {
                     tokio::spawn(async move {
                         let folder = selected.await.map(|folder| folder.path().to_path_buf());
                         let _ = events.send(Event::LocalFilesFolderChosen(folder));
+                        waker.wake();
+                    });
+                }
+                Command::InstallYoutubeTools { request } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::youtube::install_tools();
+                        let _ = events.send(Event::YoutubeToolsInstalled { request, result });
+                        waker.wake();
+                    });
+                }
+                Command::SearchYoutube {
+                    request,
+                    title,
+                    artist,
+                    duration_ms,
+                } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::youtube::search(&title, &artist, duration_ms);
+                        let _ = events.send(Event::YoutubeFound { request, result });
+                        waker.wake();
+                    });
+                }
+                Command::DownloadFromYoutube {
+                    request,
+                    id,
+                    title,
+                    artist,
+                    album,
+                } => {
+                    let events = self.events.clone();
+                    let waker = self.waker.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let folder = crate::local_songs::dir();
+                        let result =
+                            crate::youtube::download(&id, &folder, &title, &artist, &album)
+                                .and_then(|file| crate::local_songs::import(&file, &folder));
+                        let _ = events.send(Event::YoutubeDownloaded { request, result });
                         waker.wake();
                     });
                 }

@@ -55,6 +55,7 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                         }
                     });
                 }
+                Dialog::Youtube { track, stage, .. } => youtube(app, ui, &track, stage),
                 Dialog::CreatePlaylist { .. } => create_playlist(app, ui),
                 Dialog::EditPlaylist { .. } => edit_playlist(app, ui),
                 Dialog::PlaylistDuplicates { .. } => playlist_duplicates(app, ui),
@@ -231,6 +232,119 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     if response.should_close() {
         app.actions.push(Action::CloseDialog);
     }
+}
+
+/// Finding an unavailable song on YouTube: asking for the tools, waiting,
+/// picking among close matches, or why it failed.
+fn youtube(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    track: &crate::api::models::Track,
+    stage: crate::model::YoutubeStage,
+) {
+    use crate::model::YoutubeStage;
+    let palette = app.palette;
+    let locale = app.locale;
+    let paragraph = |ui: &mut egui::Ui, text: &str| {
+        ui.add(
+            egui::Label::new(
+                egui::RichText::new(text)
+                    .font(theme::regular(14.0))
+                    .color(palette.secondary),
+            )
+            .wrap(),
+        );
+    };
+    let length = |ms: u32| format!("{}:{:02}", ms / 60_000, ms / 1000 % 60);
+    theme::text(ui, "Find on YouTube", theme::bold(20.0), palette.text);
+    ui.add_space(6.0);
+    paragraph(
+        ui,
+        &format!(
+            "{} · {} · {}",
+            track.name,
+            track.artist_names(),
+            length(track.duration_ms)
+        ),
+    );
+    ui.add_space(14.0);
+    let mut close_label = "Cancel";
+    match stage {
+        YoutubeStage::NeedTools => {
+            paragraph(
+                ui,
+                "Spotifast needs two free tools to download from YouTube: yt-dlp and ffmpeg, about 150 MB from GitHub. They go in the tools folder beside the app, and Spotifast asks only this once.",
+            );
+            ui.add_space(20.0);
+            buttons(ui, |ui| {
+                if theme::pill_button(ui, &palette, "Download tools", true).clicked() {
+                    app.actions.push(Action::InstallYoutubeTools);
+                }
+                if theme::pill_button(ui, &palette, &gettext(locale, "Cancel"), false).clicked() {
+                    app.actions.push(Action::CloseDialog);
+                }
+            });
+            return;
+        }
+        YoutubeStage::InstallingTools => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                paragraph(ui, "Downloading yt-dlp and ffmpeg…");
+            });
+        }
+        YoutubeStage::Searching => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                paragraph(ui, "Searching YouTube…");
+            });
+        }
+        YoutubeStage::Downloading(title) => {
+            ui.horizontal(|ui| {
+                ui.spinner();
+                paragraph(ui, &format!("Downloading “{title}”…"));
+            });
+        }
+        YoutubeStage::Choose(videos) => {
+            paragraph(ui, "No video matches exactly. Pick the right one:");
+            ui.add_space(10.0);
+            for video in videos {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.set_max_width(300.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&video.title)
+                                    .font(theme::medium(14.0))
+                                    .color(palette.text),
+                            )
+                            .wrap(),
+                        );
+                        let mut details = video.channel.clone();
+                        if let Some(ms) = video.duration_ms {
+                            details = format!("{details} · {}", length(ms));
+                        }
+                        theme::text(ui, &details, theme::regular(12.5), palette.secondary);
+                    });
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if theme::pill_button(ui, &palette, "Download", false).clicked() {
+                            app.actions.push(Action::DownloadFromYoutube(video.clone()));
+                        }
+                    });
+                });
+                ui.add_space(8.0);
+            }
+        }
+        YoutubeStage::Failed(error) => {
+            paragraph(ui, &error);
+            close_label = "Close";
+        }
+    }
+    ui.add_space(20.0);
+    buttons(ui, |ui| {
+        if theme::pill_button(ui, &palette, close_label, false).clicked() {
+            app.actions.push(Action::CloseDialog);
+        }
+    });
 }
 
 // Keep button rows content-sized when the shared modal area last held a taller dialog.

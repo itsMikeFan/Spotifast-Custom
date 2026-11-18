@@ -1054,8 +1054,31 @@ pub struct DragEntry {
     pub image: Option<String>,
 }
 
+/// Where finding an unavailable song on YouTube has got to.
+#[derive(Clone, Debug)]
+pub enum YoutubeStage {
+    /// yt-dlp and ffmpeg are missing: ask before downloading them.
+    NeedTools,
+    InstallingTools,
+    Searching,
+    /// No video was an exact match; these are the closest.
+    Choose(Vec<crate::youtube::Candidate>),
+    /// Downloading the video with this title.
+    Downloading(String),
+    Failed(String),
+}
+
 #[derive(Clone, Debug)]
 pub enum Dialog {
+    /// Finding a song Spotify no longer plays on YouTube, to stand in for
+    /// it in `playlist`. Answers carry `request`, so a closed search's
+    /// late answers are ignored.
+    Youtube {
+        playlist: String,
+        track: Box<crate::api::models::Track>,
+        stage: YoutubeStage,
+        request: u64,
+    },
     /// A page's header cover, enlarged. Clicking anywhere or Esc closes it.
     CoverArt {
         /// The largest artwork Spotify has.
@@ -1428,6 +1451,15 @@ pub enum Action {
         playlist: String,
         replaces: Option<String>,
     },
+    /// Look for the unavailable `track` of `playlist` on YouTube.
+    FindOnYoutube {
+        playlist: String,
+        track: Box<crate::api::models::Track>,
+    },
+    /// Download yt-dlp and ffmpeg for the open YouTube search.
+    InstallYoutubeTools,
+    /// Download this video for the open YouTube search.
+    DownloadFromYoutube(crate::youtube::Candidate),
     /// Ask which of a loaded playlist's songs this account cannot play.
     CheckAvailability(String),
     /// Take the song from this PC `uri` out of `playlist`.

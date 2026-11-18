@@ -1754,7 +1754,7 @@ fn unavailable_tracks(
                 continue;
             };
             any_files |= !track.files.is_empty();
-            log::info!(
+            log::debug!(
                 "availability {} files={} alternatives={} restrictions={:?}",
                 data.entity_uri,
                 track.files.len(),

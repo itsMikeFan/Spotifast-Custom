@@ -686,6 +686,8 @@ pub struct App {
     /// The player learns of new files only when it starts: restart it once
     /// nothing is playing.
     local_songs_restart_due: bool,
+    /// Tells one YouTube search from the next.
+    youtube_request: u64,
     /// Requested shuffle mode, applied to every context until changed.
     shuffle_wanted: bool,
     /// The repeat mode saved by the last run, which the first local load
@@ -1287,6 +1289,7 @@ impl App {
             local_songs: crate::local_songs::LocalSongs::load(),
             local_songs_revision: 0,
             local_songs_restart_due: false,
+            youtube_request: 0,
             shuffle_wanted: session.shuffle_on,
             repeat_wanted: RepeatMode::from_api(&session.repeat),
             shuffle_set_at: None,
@@ -2526,6 +2529,44 @@ impl App {
                     self.set_local_files_folder(Some(folder));
                 }
                 Event::LocalFilesFolderChosen(None) => {}
+                Event::YoutubeToolsInstalled { request, result } => {
+                    self.youtube_answer(request, |app, track| match result {
+                        Ok(()) => app.search_youtube(track),
+                        Err(error) => YoutubeStage::Failed(error),
+                    });
+                }
+                Event::YoutubeFound { request, result } => {
+                    self.youtube_answer(request, |app, track| match result {
+                        Ok(crate::youtube::Found::Exact(video)) => {
+                            app.download_from_youtube(track, video)
+                        }
+                        Ok(crate::youtube::Found::Choices(videos)) => YoutubeStage::Choose(videos),
+                        Err(error) => YoutubeStage::Failed(error),
+                    });
+                }
+                Event::YoutubeDownloaded { request, result } => {
+                    if let Some(Dialog::Youtube {
+                        playlist,
+                        track,
+                        request: open,
+                        ..
+                    }) = self.dialog.clone()
+                        && open == request
+                    {
+                        match result {
+                            Ok(uri) => {
+                                self.dialog = None;
+                                self.local_songs_imported(
+                                    playlist,
+                                    Some(track.uri.clone()),
+                                    vec![Ok(uri)],
+                                );
+                                self.toast(format!("{} now plays from this PC", track.name));
+                            }
+                            Err(error) => self.set_youtube_stage(YoutubeStage::Failed(error)),
+                        }
+                    }
+                }
                 Event::LocalSongsImported {
                     playlist,
                     replaces,
@@ -10676,6 +10717,63 @@ impl App {
         }
     }
 
+    /// Applies an answer for the YouTube search `request`, if it is still open.
+    fn youtube_answer(
+        &mut self,
+        request: u64,
+        next: impl FnOnce(&mut Self, &crate::api::models::Track) -> YoutubeStage,
+    ) {
+        if let Some(Dialog::Youtube {
+            track,
+            request: open,
+            ..
+        }) = self.dialog.clone()
+            && open == request
+        {
+            let stage = next(self, &track);
+            self.set_youtube_stage(stage);
+        }
+    }
+
+    fn set_youtube_stage(&mut self, next: YoutubeStage) {
+        if let Some(Dialog::Youtube { stage, .. }) = &mut self.dialog {
+            *stage = next;
+        }
+    }
+
+    fn search_youtube(&mut self, track: &crate::api::models::Track) -> YoutubeStage {
+        self.backend.send(Command::SearchYoutube {
+            request: self.youtube_request,
+            title: track.name.clone(),
+            artist: track
+                .artists
+                .first()
+                .map(|artist| artist.name.clone())
+                .unwrap_or_default(),
+            duration_ms: track.duration_ms,
+        });
+        YoutubeStage::Searching
+    }
+
+    fn download_from_youtube(
+        &mut self,
+        track: &crate::api::models::Track,
+        video: crate::youtube::Candidate,
+    ) -> YoutubeStage {
+        self.backend.send(Command::DownloadFromYoutube {
+            request: self.youtube_request,
+            id: video.id,
+            title: track.name.clone(),
+            artist: track.artist_names(),
+            album: track
+                .album
+                .as_ref()
+                .map(|album| album.name.clone())
+                .unwrap_or_default(),
+        });
+        YoutubeStage::Downloading(video.title)
+    }
+
     /// The folder the local files scan starts from; the localsongs folder
     /// is always read beside it.
     fn local_files_scan_folder(&self) -> std::path::PathBuf {
@@ -12791,6 +12889,32 @@ impl App {
                 self.backend.choose_local_songs(playlist, replaces);
             }
             Action::CheckAvailability(id) => self.check_availability(&id),
+            Action::FindOnYoutube { playlist, track } => {
+                self.youtube_request += 1;
+                let stage = if crate::youtube::tools_ready() {
+                    self.search_youtube(&track)
+                } else {
+                    YoutubeStage::NeedTools
+                };
+                self.dialog = Some(Dialog::Youtube {
+                    playlist,
+                    track,
+                    stage,
+                    request: self.youtube_request,
+                });
+            }
+            Action::InstallYoutubeTools => {
+                self.set_youtube_stage(YoutubeStage::InstallingTools);
+                self.backend.send(Command::InstallYoutubeTools {
+                    request: self.youtube_request,
+                });
+            }
+            Action::DownloadFromYoutube(video) => {
+                if let Some(Dialog::Youtube { track, .. }) = self.dialog.clone() {
+                    let stage = self.download_from_youtube(&track, video);
+                    self.set_youtube_stage(stage);
+                }
+            }
             Action::RemoveLocalSong { playlist, uri } => {
                 if self.local_songs.remove(&playlist, &uri) {
                     self.save_local_songs();
