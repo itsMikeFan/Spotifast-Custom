@@ -9,8 +9,8 @@ use egui::Color32;
 
 use crate::api::PlayRequest;
 use crate::api::models::{
-    Album, Artist, ArtistRef, Device, PlayableItem, PlaybackState, Playlist, PlaylistItem, Queue,
-    Show, Track, TrackCount, User, UserRef, pick_image,
+    Album, Artist, ArtistRef, Device, Image, PlayableItem, PlaybackState, Playlist, PlaylistItem,
+    Queue, Show, Track, TrackCount, User, UserRef, pick_image,
 };
 use crate::backend::{
     ApiRequest, ApiResponse, AuthStatus, Backend, Command, Event, LocalPlayback, LyricsRequest,
@@ -7644,12 +7644,50 @@ impl App {
             ApiResponse::PlaylistCreated(result) => {
                 self.playlist_busy = false;
                 match result {
-                    Ok(playlist) => {
+                    Ok(mut playlist) => {
                         self.toast(
                             // Translators: {name} is a playlist name.
                             gettext(self.locale, "Created {name}")
                                 .replace("{name}", &playlist.name),
                         );
+                        let (add_uris, chosen_public) = match self.dialog.take() {
+                            Some(Dialog::CreatePlaylist {
+                                add_uris, public, ..
+                            }) => (add_uris, Some(public)),
+                            _ => (Vec::new(), None),
+                        };
+                        // Spotify's reads lag a new playlist by about a
+                        // minute, so it is shown from what this app knows:
+                        // its owner, the first song's cover and its songs.
+                        if playlist.owner.display_name.is_none() {
+                            playlist.owner.display_name =
+                                self.own_name(playlist.owner.id.as_deref());
+                        }
+                        if playlist.images.is_empty()
+                            && let Some(url) = add_uris.iter().find_map(|uri| {
+                                self.shown_item(uri)?.image(640).map(str::to_string)
+                            })
+                        {
+                            playlist.images = vec![Image {
+                                url,
+                                ..Image::default()
+                            }];
+                        }
+                        if let Some(public) = chosen_public
+                            && playlist.public != Some(public)
+                        {
+                            // Spotify has been seen to make a playlist public
+                            // when it was asked for a private one.
+                            if playlist.public == Some(!public) {
+                                self.backend.api(ApiRequest::UpdatePlaylist {
+                                    id: playlist.id.clone(),
+                                    name: None,
+                                    description: None,
+                                    public: Some(public),
+                                });
+                            }
+                            playlist.public = Some(public);
+                        }
                         let settled_by = self.library.playlists_generation + 1;
                         self.edit_playlists(PlaylistEdit {
                             uri: playlist.uri.clone(),
@@ -7658,16 +7696,13 @@ impl App {
                         });
                         self.saved.insert(playlist.uri.clone(), true);
                         self.store_library_cache();
-                        let add_uris = match self.dialog.take() {
-                            Some(Dialog::CreatePlaylist { add_uris, .. }) => add_uris,
-                            _ => Vec::new(),
-                        };
-                        // The new playlist is empty until the songs below are
-                        // added, so it is shown at once from what this app
-                        // knows instead of from Spotify's lagging reads.
-                        let items: Option<Vec<PlayableItem>> =
-                            add_uris.iter().map(|uri| self.shown_item(uri)).collect();
-                        if let Some(items) = items {
+                        // Unknown songs are asked of Spotify by URI; an
+                        // episode this app never showed cannot be, so then
+                        // the songs go straight to Spotify as before.
+                        let resolvable = add_uris.iter().all(|uri| {
+                            uri.starts_with("spotify:track:") || self.shown_item(uri).is_some()
+                        });
+                        if resolvable {
                             self.playlist_pages.insert(
                                 playlist.id.clone(),
                                 PlaylistPage {
@@ -7681,11 +7716,13 @@ impl App {
                                     ..PlaylistPage::default()
                                 },
                             );
-                            if !items.is_empty() {
+                            if !add_uris.is_empty() {
                                 self.fresh_playlists.insert(playlist.id.clone());
                             }
                             self.open(Page::Playlist(playlist.id.clone()));
-                            self.add_to_playlist_now(playlist.id, playlist.name, items, None);
+                            if !add_uris.is_empty() {
+                                self.add_songs_when_known(playlist.id, playlist.name, add_uris);
+                            }
                         } else {
                             self.backend.api(ApiRequest::AddToPlaylist {
                                 playlist_id: playlist.id.clone(),
@@ -10823,6 +10860,17 @@ impl App {
             ));
             return;
         }
+        self.add_songs_when_known(playlist_id, playlist_name, uris);
+    }
+
+    /// Adds songs by URI once each has its name: those this app has shown
+    /// at once, the rest after Spotify answers for them.
+    fn add_songs_when_known(
+        &mut self,
+        playlist_id: String,
+        playlist_name: String,
+        uris: Vec<String>,
+    ) {
         let mut paste = PendingPaste {
             playlist_id,
             playlist_name,
@@ -10834,7 +10882,7 @@ impl App {
             if paste.found.contains_key(&uri) || paste.missing.contains(&uri) {
                 continue;
             }
-            if let Some(item) = self.known_song(&uri) {
+            if let Some(item) = self.shown_item(&uri) {
                 paste.found.insert(uri, item);
             } else if let Some(id) = uri.strip_prefix("spotify:track:").map(str::to_string) {
                 if self.track_requests.insert(id.clone()) {
@@ -16799,8 +16847,19 @@ mod tests {
     #[test]
     fn a_new_playlist_shows_its_songs_at_once() {
         let mut app = connected_listener();
+        app.user = Some(User {
+            id: "alice".into(),
+            display_name: Some("Alice".into()),
+            ..Default::default()
+        });
         store_track(&mut app, "a");
-        store_track(&mut app, "b");
+        app.track_cache.get_mut("a").unwrap().album = Some(Album {
+            images: vec![Image {
+                url: "https://i.scdn.co/image/a".into(),
+                ..Image::default()
+            }],
+            ..Album::default()
+        });
         app.dialog = Some(Dialog::CreatePlaylist {
             name: "New".into(),
             public: false,
@@ -16810,9 +16869,27 @@ mod tests {
             id: "n".into(),
             uri: "spotify:playlist:n".into(),
             name: "New".into(),
+            owner: crate::api::models::Owner {
+                id: Some("alice".into()),
+                ..Default::default()
+            },
+            public: Some(true),
             items_count: Some(TrackCount { total: 0 }),
             ..Playlist::default()
         })));
+        let shown = app.playlist_pages["n"].playlist.get().unwrap().clone();
+        assert_eq!(shown.owner.display_name.as_deref(), Some("Alice"));
+        assert_eq!(shown.images[0].url, "https://i.scdn.co/image/a");
+        assert_eq!(shown.public, Some(false), "the private choice stands");
+        // "b" was never shown here, so its name is asked of Spotify first.
+        app.handle_api(ApiResponse::Track {
+            id: "b".into(),
+            result: Ok(Track {
+                id: Some("b".into()),
+                uri: "spotify:track:b".into(),
+                ..Track::default()
+            }),
+        });
         let rows = |app: &App| -> Vec<String> {
             app.playlist_pages["n"]
                 .items
