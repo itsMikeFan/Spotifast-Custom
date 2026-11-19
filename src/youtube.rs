@@ -226,6 +226,45 @@ const NOISE: &[&str] = &[
     "si",
 ];
 
+/// Words that mark an edited, re-recorded or re-mixed upload. A video
+/// whose title has one is never taken as the song unless the Spotify title
+/// has it too, and is ranked below the rest.
+const ALTERED: &[&str] = &[
+    "bass",
+    "boosted",
+    "boost",
+    "sped",
+    "speed",
+    "speedup",
+    "slowed",
+    "reverb",
+    "nightcore",
+    "8d",
+    "remix",
+    "rmx",
+    "cover",
+    "karaoke",
+    "instrumental",
+    "live",
+    "extended",
+    "edit",
+    "mashup",
+    "acapella",
+    "tiktok",
+    "loop",
+    "hour",
+    "hours",
+    "reverse",
+    "remake",
+    "bootleg",
+    "trap",
+    "phonk",
+    "lofi",
+    "piano",
+    "acoustic",
+    "concert",
+];
+
 /// Lowercase words without accents, punctuation, or [`NOISE`].
 fn words(text: &str) -> Vec<String> {
     let plain: String = text
@@ -269,15 +308,27 @@ pub fn judge(title: &str, artist: &str, duration_ms: u32, candidates: Vec<Candid
     let artist_words = words(artist);
     let score = |candidate: &Candidate| -> (f32, bool) {
         let held = words(&format!("{} {}", candidate.title, candidate.channel));
+        // A word that marks an altered version the Spotify song is not.
+        let altered = words(&candidate.title)
+            .iter()
+            .any(|word| ALTERED.contains(&word.as_str()) && !title_words.contains(word));
+        // The artist's own channel, or the one YouTube makes from a label's upload.
+        let official = coverage(&artist_words, &words(&candidate.channel)) == 1.0
+            || candidate.channel.ends_with(" - Topic");
         let title_share = coverage(&title_words, &held);
         let artist_share = coverage(&artist_words, &held);
         let gap = candidate
             .duration_ms
             .map(|ms| ms.abs_diff(duration_ms))
             .unwrap_or(u32::MAX);
-        let exact = title_share == 1.0 && artist_share == 1.0 && gap <= 5_000;
+        let exact = title_share == 1.0 && artist_share == 1.0 && gap <= 5_000 && !altered;
         let closeness = 1.0 / (1.0 + gap as f32 / 10_000.0);
-        (title_share * 2.0 + artist_share + closeness, exact)
+        let penalty = if altered { 3.0 } else { 0.0 };
+        let bonus = if official { 0.5 } else { 0.0 };
+        (
+            title_share * 3.0 + artist_share + closeness + bonus - penalty,
+            exact,
+        )
     };
     if let Some(exact) = candidates.iter().find(|candidate| score(candidate).1) {
         return Found::Exact(exact.clone());
@@ -426,6 +477,30 @@ mod tests {
                 498
             ))
         );
+    }
+
+    /// An altered upload is never downloaded as the song, even with the
+    /// right words and length, and the original ranks above it.
+    #[test]
+    fn a_bass_boosted_upload_is_never_the_match() {
+        let boosted = video("Ovidiu Rusu - Song Name (BASS BOOSTED)", "Car Music", 200);
+        let original = video("Ovidiu Rusu - Song Name", "Some Uploader", 260);
+        let found = judge(
+            "Song Name",
+            "Ovidiu Rusu",
+            200_000,
+            vec![boosted.clone(), original.clone()],
+        );
+        assert_eq!(found, Found::Choices(vec![original, boosted]));
+        // Unless Spotify's own title says the same.
+        let live = video("Ovidiu Rusu - Song Name (Live)", "Ovidiu Rusu", 200);
+        let found = judge(
+            "Song Name - Live",
+            "Ovidiu Rusu",
+            200_000,
+            vec![live.clone()],
+        );
+        assert_eq!(found, Found::Exact(live));
     }
 
     #[test]
