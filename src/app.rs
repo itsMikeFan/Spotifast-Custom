@@ -14305,15 +14305,17 @@ fn autoplay_seed(
     near_end.then(|| track.uri.clone())
 }
 
-/// Caps large track lists at 500 items starting from the selected row.
+/// Caps large track lists at 500 items around the selected row. Half of
+/// them come before it, so Previous still steps back through the list
+/// instead of stopping at the chosen song.
 fn cap_uris(uris: &[String], index: u32) -> (Vec<String>, u32) {
     const MAX: usize = 500;
     if uris.len() <= MAX {
         return (uris.to_vec(), index);
     }
-    let start = (index as usize).min(uris.len().saturating_sub(1));
-    let end = (start + MAX).min(uris.len());
-    (uris[start..end].to_vec(), 0)
+    let index = (index as usize).min(uris.len() - 1);
+    let start = index.saturating_sub(MAX / 2).min(uris.len() - MAX);
+    (uris[start..start + MAX].to_vec(), (index - start) as u32)
 }
 
 fn evict_lru_map<V>(
@@ -30620,6 +30622,24 @@ mod tests {
 
     /// Songs the session says this account cannot play are greyed out in
     /// every loaded playlist; a failed check may be asked again.
+    /// A long list keeps the songs before the chosen one, so Previous can
+    /// go back to them (a playlist of 703 songs once started at its row).
+    #[test]
+    fn capped_lists_keep_the_songs_before_the_chosen_row() {
+        let uris: Vec<String> = (0..703).map(|n| format!("spotify:track:{n}")).collect();
+        let (list, index) = cap_uris(&uris, 300);
+        assert_eq!(list.len(), 500);
+        assert_eq!(list[index as usize], "spotify:track:300");
+        assert_eq!(index, 250);
+        let (list, index) = cap_uris(&uris, 700);
+        assert_eq!(
+            (list.len(), list[index as usize].as_str()),
+            (500, "spotify:track:700")
+        );
+        let (list, index) = cap_uris(&uris, 3);
+        assert_eq!((list[0].as_str(), index), ("spotify:track:0", 3));
+    }
+
     #[test]
     fn songs_the_session_cannot_play_are_greyed_out() {
         let mut app = headless_app();
