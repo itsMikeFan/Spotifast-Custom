@@ -216,13 +216,14 @@ pub fn tag_if_untagged(path: &Path) -> std::io::Result<()> {
         Some((artist, title)) => (artist.trim(), title.trim()),
         None => ("", stem.trim()),
     };
-    let mut tagged = id3_tag(title, artist, "");
+    let mut tagged = id3_tag(title, artist, "", None);
     tagged.extend_from_slice(&audio);
     std::fs::write(path, tagged)
 }
 
-/// A minimal ID3v2.4 tag with UTF-8 title, artist and album frames.
-pub fn id3_tag(title: &str, artist: &str, album: &str) -> Vec<u8> {
+/// A minimal ID3v2.4 tag with UTF-8 title, artist and album frames, and
+/// `cover` (JPEG or PNG bytes) as the front cover the app shows.
+pub fn id3_tag(title: &str, artist: &str, album: &str, cover: Option<&[u8]>) -> Vec<u8> {
     let mut frames = Vec::new();
     for (id, text) in [(b"TIT2", title), (b"TPE1", artist), (b"TALB", album)] {
         if text.is_empty() {
@@ -232,6 +233,22 @@ pub fn id3_tag(title: &str, artist: &str, album: &str) -> Vec<u8> {
         frames.extend_from_slice(&syncsafe(text.len() as u32 + 1));
         frames.extend_from_slice(&[0, 0, 3]);
         frames.extend_from_slice(text.as_bytes());
+    }
+    if let Some(picture) = cover {
+        let mime: &[u8] = if picture.starts_with(&[0x89, b'P', b'N', b'G']) {
+            b"image/png"
+        } else {
+            b"image/jpeg"
+        };
+        // Encoding, MIME type, front cover, empty description, picture.
+        let mut body = vec![0];
+        body.extend_from_slice(mime);
+        body.extend_from_slice(&[0, 3, 0]);
+        body.extend_from_slice(picture);
+        frames.extend_from_slice(b"APIC");
+        frames.extend_from_slice(&syncsafe(body.len() as u32));
+        frames.extend_from_slice(&[0, 0]);
+        frames.extend_from_slice(&body);
     }
     let mut tag = b"ID3\x04\x00\x00".to_vec();
     tag.extend_from_slice(&syncsafe(frames.len() as u32));
@@ -280,7 +297,7 @@ mod tests {
 
     #[test]
     fn the_tag_holds_each_frame_with_its_syncsafe_size() {
-        let tag = id3_tag("Song", "Artist", "");
+        let tag = id3_tag("Song", "Artist", "", None);
         assert!(tag.starts_with(b"ID3\x04\x00\x00"));
         // 2 frames of 10 header bytes, an encoding byte and the text.
         assert_eq!(&tag[6..10], &[0, 0, 0, 10 + 5 + 10 + 7]);

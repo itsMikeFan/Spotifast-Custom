@@ -299,6 +299,7 @@ pub fn download(
     title: &str,
     artist: &str,
     album: &str,
+    cover_url: Option<&str>,
 ) -> Result<PathBuf, String> {
     std::fs::create_dir_all(folder).map_err(|error| error.to_string())?;
     let name = file_name(&if artist.is_empty() {
@@ -322,7 +323,9 @@ pub fn download(
         .map(|line| PathBuf::from(line.trim()))
         .filter(|path| path.exists())
         .unwrap_or_else(|| folder.join(format!("{name}.mp3")));
-    retag(&file, title, artist, album).map_err(|error| error.to_string())?;
+    let thumbnail = format!("https://i.ytimg.com/vi/{id}/hqdefault.jpg");
+    let cover = cover_url.and_then(fetch).or_else(|| fetch(&thumbnail));
+    retag(&file, title, artist, album, cover.as_deref()).map_err(|error| error.to_string())?;
     Ok(file)
 }
 
@@ -347,12 +350,32 @@ fn file_name(text: &str) -> String {
 }
 
 /// Replaces an MP3's ID3v2 tag with one naming the Spotify song.
-fn retag(path: &Path, title: &str, artist: &str, album: &str) -> std::io::Result<()> {
+fn retag(
+    path: &Path,
+    title: &str,
+    artist: &str,
+    album: &str,
+    cover: Option<&[u8]>,
+) -> std::io::Result<()> {
     let audio = std::fs::read(path)?;
     let start = id3_len(&audio).min(audio.len());
-    let mut tagged = crate::local_songs::id3_tag(title, artist, album);
+    let mut tagged = crate::local_songs::id3_tag(title, artist, album, cover);
     tagged.extend_from_slice(&audio[start..]);
     std::fs::write(path, tagged)
+}
+
+/// The picture at `url`; a cover that fails to download is left out.
+fn fetch(url: &str) -> Option<Vec<u8>> {
+    let response = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .ok()?
+        .get(url)
+        .send()
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    response.bytes().ok().map(|bytes| bytes.to_vec())
 }
 
 /// The length of the ID3v2 tag `audio` starts with, or 0.
@@ -445,7 +468,7 @@ mod tests {
 
     #[test]
     fn retagging_replaces_the_old_tag() {
-        let old = crate::local_songs::id3_tag("Old", "Someone", "");
+        let old = crate::local_songs::id3_tag("Old", "Someone", "", Some(b"\xff\xd8cover"));
         let mut file = old.clone();
         file.extend_from_slice(b"\xff\xfbaudio");
         assert_eq!(id3_len(&file), old.len());

@@ -10770,6 +10770,12 @@ impl App {
                 .as_ref()
                 .map(|album| album.name.clone())
                 .unwrap_or_default(),
+            // Spotify lists an album's largest cover first.
+            cover_url: track
+                .album
+                .as_ref()
+                .and_then(|album| album.images.first())
+                .map(|image| image.url.clone()),
         });
         YoutubeStage::Downloading(video.title)
     }

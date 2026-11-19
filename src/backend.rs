@@ -794,6 +794,7 @@ pub enum Command {
         title: String,
         artist: String,
         album: String,
+        cover_url: Option<String>,
     },
     /// Copy the picked files into the localsongs folder for `playlist`.
     ImportLocalSongs {
@@ -2385,14 +2386,21 @@ impl Worker {
                     title,
                     artist,
                     album,
+                    cover_url,
                 } => {
                     let events = self.events.clone();
                     let waker = self.waker.clone();
                     tokio::task::spawn_blocking(move || {
                         let folder = crate::local_songs::dir();
-                        let result =
-                            crate::youtube::download(&id, &folder, &title, &artist, &album)
-                                .and_then(|file| crate::local_songs::import(&file, &folder));
+                        let result = crate::youtube::download(
+                            &id,
+                            &folder,
+                            &title,
+                            &artist,
+                            &album,
+                            cover_url.as_deref(),
+                        )
+                        .and_then(|file| crate::local_songs::import(&file, &folder));
                         let _ = events.send(Event::YoutubeDownloaded { request, result });
                         waker.wake();
                     });
