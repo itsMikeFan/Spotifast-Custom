@@ -56,6 +56,9 @@ object Playback {
     /** librespot keeps a reusable playback sign-in here after the first one. */
     val hasPlaybackSignIn get() = File(cacheDir, "credentials.json").exists()
 
+    /** Sign out forgets the playback sign-in too, so signing in again starts clean. */
+    fun forgetPlaybackSignIn() = File(cacheDir, "credentials.json").delete()
+
     fun init(context: Context) {
         app = context.applicationContext
         val p = app.getSharedPreferences("effects", Context.MODE_PRIVATE)

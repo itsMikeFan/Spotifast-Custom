@@ -45,3 +45,8 @@ lto = "thin"
 codegen-units = 1
 strip = true
 hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca4811371ddae81c06be168de54194938d70b1" }
+
+# The other librespot crates reach librespot-core by path inside the fork's
+# git checkout; point those at the vendored copy too, so one copy exists.
+[patch."https://github.com/crmne/librespot"]
+librespot-core = { path = "vendor/librespot-core" }

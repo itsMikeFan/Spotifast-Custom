@@ -64,7 +64,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun Root() {
     var signedIn by remember { mutableStateOf(Spotify.signedIn && Playback.hasPlaybackSignIn) }
-    if (!signedIn) SignIn { signedIn = true } else Library { Spotify.signOut(); signedIn = false }
+    if (!signedIn) SignIn { signedIn = true } else Library { Spotify.signOut(); Playback.forgetPlaybackSignIn(); signedIn = false }
 }
 
 @Composable
