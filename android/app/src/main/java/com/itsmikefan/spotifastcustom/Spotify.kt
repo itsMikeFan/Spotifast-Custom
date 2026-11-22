@@ -218,7 +218,8 @@ object Spotify {
     }
 
     suspend fun setPublic(playlist: Playlist, public: Boolean) {
-        call("PUT", "/playlists/${playlist.id}", JSONObject().put("public", public))
+        // Sent with the name, as the desktop's update_playlist does.
+        call("PUT", "/playlists/${playlist.id}", JSONObject().put("name", playlist.name).put("public", public))
     }
 
     suspend fun playlists(): List<Playlist> {

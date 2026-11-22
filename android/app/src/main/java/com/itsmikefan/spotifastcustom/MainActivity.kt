@@ -155,7 +155,11 @@ private fun Library(signOut: () -> Unit) {
                 } ?: Loading()
                 else -> {
                     BackHandler { open = null }
-                    Tracks(playlist, playlists.orEmpty().filter { it.owned && it.id != playlist.id }) { error = it }
+                    Tracks(
+                        playlist, playlists.orEmpty().filter { it.owned && it.id != playlist.id },
+                        // Kept in the list too, or reopening the playlist would show the old setting.
+                        onPublic = { value -> playlists = playlists?.map { if (it.id == playlist.id) it.copy(public = value) else it } },
+                    ) { error = it }
                 }
             }
         }
@@ -171,16 +175,16 @@ private fun Loading() = Column(Modifier.fillMaxSize(), Arrangement.Center, Align
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Tracks(playlist: Playlist, targets: List<Playlist>, onError: (String) -> Unit) {
-    var tracks by remember(playlist) { mutableStateOf<List<Track>?>(null) }
+private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boolean) -> Unit, onError: (String) -> Unit) {
+    var tracks by remember(playlist.id) { mutableStateOf<List<Track>?>(null) }
     var reload by remember { mutableIntStateOf(0) }
     var menuFor by remember { mutableStateOf<Track?>(null) }
     var adding by remember { mutableStateOf<Track?>(null) }
     var finding by remember { mutableStateOf(false) }
-    var public by remember(playlist) { mutableStateOf(playlist.public) }
+    var public by remember(playlist.id) { mutableStateOf(playlist.public) }
     val playing by Playback.state.collectAsState()
     val scope = rememberCoroutineScope()
-    LaunchedEffect(playlist, reload) {
+    LaunchedEffect(playlist.id, reload) {
         runCatching { Spotify.tracks(playlist) }.onSuccess { tracks = it }.onFailure { onError(it.message ?: "Could not load songs") }
     }
     val list = tracks ?: return Loading()
@@ -195,8 +199,13 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onError: (String
                     val was = public
                     val now = was == false
                     public = now
+                    onPublic(now)
                     scope.launch {
-                        runCatching { Spotify.setPublic(playlist, now) }.onFailure { public = was; onError(it.message ?: "Could not change it") }
+                        runCatching { Spotify.setPublic(playlist, now) }.onFailure {
+                            public = was
+                            was?.let(onPublic)
+                            onError("Could not make it ${if (now) "public" else "private"}: ${it.message}")
+                        }
                     }
                 }) { Text(if (public == false) "Make public" else "Make private") }
                 TextButton(onClick = { finding = true }) { Text("Find duplicates") }
