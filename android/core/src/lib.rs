@@ -14,6 +14,7 @@ mod eq;
 mod limiter;
 #[path = "../../../src/resample.rs"]
 mod resample;
+mod vis;
 
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -28,13 +29,13 @@ use librespot_core::cache::Cache;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
 use librespot_metadata::audio::UniqueFields;
+use librespot_playback::SAMPLE_RATE;
 use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
 use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
 use librespot_playback::mixer::{self, MixerConfig};
 use librespot_playback::player::{Player, PlayerEvent};
-use librespot_playback::SAMPLE_RATE;
 
 /// The client the playback grant belongs to (src/auth.rs on the desktop).
 const PLAYBACK_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
@@ -84,8 +85,9 @@ impl State {
             .min(self.duration_ms.max(self.position_ms))
     }
 
-    fn json(&self, rate: f64) -> String {
+    fn json(&self, rate: f64, next: &[String]) -> String {
         serde_json::json!({
+            "next": next,
             "connected": self.connected,
             "playing": self.playing,
             "uri": self.uri,
@@ -159,6 +161,7 @@ impl Sink for AndroidSink {
         // limiter, since bass and reverb can push past full scale.
         let mut samples = self.effects.process(samples);
         self.limiter.process(&mut samples, 1.0);
+        vis::push(&samples);
         let samples = converter.f64_to_f32(&samples);
         let mut env = self
             .vm
@@ -222,14 +225,19 @@ fn connect(
             position_update_interval: Some(std::time::Duration::from_secs(1)),
             ..PlayerConfig::default()
         };
-        let player = Player::new(player_config, session.clone(), mixer.get_soft_volume(), move || {
-            Box::new(AndroidSink {
-                vm,
-                out,
-                effects: effects::Processor::new(EFFECTS.clone()),
-                limiter: limiter::Limiter::new(f64::from(SAMPLE_RATE)),
-            })
-        });
+        let player = Player::new(
+            player_config,
+            session.clone(),
+            mixer.get_soft_volume(),
+            move || {
+                Box::new(AndroidSink {
+                    vm,
+                    out,
+                    effects: effects::Processor::new(EFFECTS.clone()),
+                    limiter: limiter::Limiter::new(f64::from(SAMPLE_RATE)),
+                })
+            },
+        );
         tokio::spawn(follow(player.get_player_event_channel()));
         let config = ConnectConfig {
             name: device_name,
@@ -368,6 +376,35 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_load<'a>(
     });
 }
 
+/// Adds a song to Spotify's queue: it plays after the current song.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_queue<'a>(
+    mut env: JNIEnv<'a>,
+    _this: JObject<'a>,
+    uri: JString<'a>,
+) {
+    let Some(uri) = string(&mut env, &uri) else {
+        return;
+    };
+    guard((), || {
+        spirc(|spirc| spirc.add_to_queue(librespot_core::SpotifyUri::from_uri(&uri)?))
+    });
+}
+
+/// The visualizer's bar heights, 0 to 1, from the most recent sound.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_bands<'a>(
+    env: JNIEnv<'a>,
+    _this: JObject<'a>,
+) -> jni::sys::jfloatArray {
+    let bands = guard(vec![0.0; vis::BANDS], vis::bands);
+    let Ok(array) = env.new_float_array(bands.len() as i32) else {
+        return std::ptr::null_mut();
+    };
+    let _ = env.set_float_array_region(&array, 0, &bands);
+    array.into_raw()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_command(
     _env: JNIEnv,
@@ -415,7 +452,25 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_state<'a>(
     env: JNIEnv<'a>,
     _this: JObject<'a>,
 ) -> jstring {
-    let json = guard(String::from("{}"), || state().json(rate()));
+    let json = guard(String::from("{}"), || {
+        // shortcut: only the first 100 upcoming songs are shown; enough for an "Up next" list.
+        let next: Vec<String> = SPIRC
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map(|spirc| {
+                spirc
+                    .watch_queue_list()
+                    .borrow()
+                    .next_tracks
+                    .iter()
+                    .take(100)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        state().json(rate(), &next)
+    });
     env.new_string(json)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())

@@ -19,9 +19,15 @@ object Core {
 
     external fun command(command: Int, value: Int)
 
+    /** Adds a song to Spotify's queue, after the current one. */
+    external fun queue(uri: String)
+
+    /** The visualizer's bar heights, 0 to 1. */
+    external fun bands(): FloatArray
+
     external fun setEffects(on: Boolean, ratePercent: Int, bassDb: Float, reverbMix: Float, reverbRoom: Float)
 
-    /** JSON: connected, playing, uri, name, artists, duration_ms, position_ms. */
+    /** JSON: next (upcoming URIs), connected, playing, uri, name, artists, duration_ms, position_ms. */
     external fun state(): String
 
     const val PLAY = 0

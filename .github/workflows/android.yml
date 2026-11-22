@@ -50,9 +50,9 @@ jobs:
         working-directory: android/core
         run: cargo ndk -t arm64-v8a --platform 26 -o ../app/src/main/jniLibs build --release
 
-      - name: Build the APK
+      - name: Test and build the APK
         working-directory: android
-        run: gradle --no-daemon assembleDebug
+        run: gradle --no-daemon testDebugUnitTest assembleDebug
 
       - name: Name the APK
         run: cp android/app/build/outputs/apk/debug/app-debug.apk spotifast-custom.apk

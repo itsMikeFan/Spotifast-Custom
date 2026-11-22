@@ -6,6 +6,9 @@ import android.net.Uri
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
@@ -16,8 +19,11 @@ import java.net.URLEncoder
 import java.security.MessageDigest
 import java.security.SecureRandom
 
-data class Playlist(val name: String, val uri: String, val tracksPath: String, val count: Int)
-data class Track(val uri: String, val name: String, val artists: String, val durationMs: Int)
+data class Playlist(
+    val name: String, val uri: String, val tracksPath: String, val count: Int,
+    val id: String = "", val owned: Boolean = false, val public: Boolean? = null,
+)
+data class Track(val uri: String, val name: String, val artists: String, val lead: String, val durationMs: Int)
 
 /**
  * Sign-in and the Web API, the same two grants as the desktop's src/auth.rs:
@@ -160,29 +166,59 @@ object Spotify {
         return prefs.getString("access_token", null)!!
     }
 
+    private val http = okhttp3.OkHttpClient()
+
+    /** Every song seen in a loaded playlist, so "Up next" can name the queue's URIs. */
+    val known = java.util.concurrent.ConcurrentHashMap<String, Track>()
+
     /** A Web API GET; [path] is relative to /v1 or a full `next` URL. */
-    suspend fun get(path: String): JSONObject = withContext(Dispatchers.IO) {
+    suspend fun get(path: String): JSONObject = call("GET", path, null) ?: JSONObject()
+
+    /** A Web API request, refreshing the token once on 401 and waiting once on 429. Returns the JSON body, if any. */
+    private suspend fun call(method: String, path: String, body: JSONObject?): JSONObject? = withContext(Dispatchers.IO) {
         val url = if (path.startsWith("https://")) path else "https://api.spotify.com/v1$path"
+        val payload = body?.toString()?.toRequestBody("application/json".toMediaType())
         var refreshed = false
         var waited = false
         while (true) {
-            val connection = URL(url).openConnection() as HttpURLConnection
-            connection.setRequestProperty("Authorization", "Bearer ${accessToken(refreshed)}")
-            when (val status = connection.responseCode) {
-                in 200..299 -> return@withContext JSONObject(connection.inputStream.bufferedReader().readText())
-                401 -> if (!refreshed) { refreshed = true; continue }
-                429 -> if (!waited) {
-                    waited = true
-                    Thread.sleep((connection.getHeaderField("Retry-After")?.toLongOrNull() ?: 2).coerceAtMost(30) * 1000)
-                    continue
+            val request = okhttp3.Request.Builder().url(url)
+                .header("Authorization", "Bearer ${accessToken(refreshed)}")
+                .method(method, payload)
+                .build()
+            http.newCall(request).execute().use { response ->
+                val text = response.body?.string().orEmpty()
+                when {
+                    response.isSuccessful -> return@withContext text.takeIf { it.isNotBlank() }?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    response.code == 401 && !refreshed -> refreshed = true
+                    response.code == 429 && !waited -> {
+                        waited = true
+                        Thread.sleep((response.header("Retry-After")?.toLongOrNull() ?: 2).coerceAtMost(30) * 1000)
+                    }
+                    else -> throw IOException("Spotify answered ${response.code}: $text")
                 }
-                else -> {}
             }
-            val error = connection.errorStream?.bufferedReader()?.readText() ?: ""
-            throw IOException("Spotify answered ${connection.responseCode}: $error")
         }
         @Suppress("UNREACHABLE_CODE")
-        error("unreachable")
+        null
+    }
+
+    suspend fun add(playlist: Playlist, uris: List<String>, position: Int? = null) {
+        val body = JSONObject().put("uris", JSONArray(uris))
+        position?.let { body.put("position", it) }
+        call("POST", "/playlists/${playlist.id}/items", body)
+    }
+
+    /** Removes every copy of each URI; see [Dupes.plan] to keep some. */
+    suspend fun remove(playlist: Playlist, uris: List<String>) {
+        // Spotify takes at most 100 per request.
+        for (chunk in uris.chunked(100)) {
+            val items = JSONArray(chunk.map { JSONObject().put("uri", it) })
+            call("DELETE", "/playlists/${playlist.id}/items", JSONObject().put("items", items))
+        }
+    }
+
+    suspend fun setPublic(playlist: Playlist, public: Boolean) {
+        call("PUT", "/playlists/${playlist.id}", JSONObject().put("public", public))
     }
 
     suspend fun playlists(): List<Playlist> {
@@ -197,7 +233,12 @@ object Spotify {
                 val id = p.getString("id")
                 // Newer apps get "items", older ones "tracks", for the count.
                 val count = (p.optJSONObject("items") ?: p.optJSONObject("tracks"))?.optInt("total", -1) ?: -1
-                result += Playlist(p.optString("name"), p.getString("uri"), "/playlists/$id/items?limit=50", count)
+                val owner = p.optJSONObject("owner")?.optString("id")
+                val public = if (p.isNull("public")) null else p.optBoolean("public")
+                result += Playlist(
+                    p.optString("name"), p.getString("uri"), "/playlists/$id/items?limit=50", count,
+                    id, owner == userId, public,
+                )
             }
             next = page.optString("next").takeIf { it.isNotEmpty() && it != "null" }
         }
@@ -214,10 +255,12 @@ object Spotify {
                 val row = items.optJSONObject(i) ?: continue
                 val t = row.optJSONObject("item") ?: row.optJSONObject("track") ?: continue
                 val uri = t.optString("uri").takeIf { it.isNotEmpty() } ?: continue
-                val artists = t.optJSONArray("artists")?.let { a ->
-                    (0 until a.length()).joinToString(", ") { a.getJSONObject(it).optString("name") }
-                } ?: ""
-                result += Track(uri, t.optString("name"), artists, t.optInt("duration_ms"))
+                val names = t.optJSONArray("artists")?.let { a ->
+                    (0 until a.length()).map { a.getJSONObject(it).optString("name") }
+                } ?: emptyList()
+                val track = Track(uri, t.optString("name"), names.joinToString(", "), names.firstOrNull() ?: "", t.optInt("duration_ms"))
+                known[uri] = track
+                result += track
             }
             next = page.optString("next").takeIf { it.isNotEmpty() && it != "null" }
         }

@@ -25,6 +25,8 @@ data class PlayState(
     val artists: String = "",
     val durationMs: Int = 0,
     val positionMs: Int = 0,
+    /** Upcoming song URIs: the queue, then the rest of the playlist. */
+    val next: List<String> = emptyList(),
 )
 
 data class Effects(
@@ -102,6 +104,13 @@ object Playback {
         }
     }
 
+    fun queue(uri: String) {
+        scope.launch {
+            if (connect() != null) return@launch
+            withContext(Dispatchers.IO) { Core.queue(uri) }
+        }
+    }
+
     /** Sends a command, reconnecting first if the session dropped. */
     fun command(command: Int, value: Int = 0) {
         scope.launch {
@@ -115,6 +124,7 @@ object Playback {
         PlayState(
             o.optBoolean("connected"), o.optBoolean("playing"), o.optString("uri"), o.optString("name"),
             o.optString("artists"), o.optInt("duration_ms"), o.optInt("position_ms"),
+            o.optJSONArray("next")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList(),
         )
     }.getOrDefault(PlayState())
 }

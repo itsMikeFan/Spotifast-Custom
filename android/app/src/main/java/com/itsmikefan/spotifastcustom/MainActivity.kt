@@ -6,7 +6,11 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -20,7 +24,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
@@ -34,18 +41,23 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -143,7 +155,7 @@ private fun Library(signOut: () -> Unit) {
                 } ?: Loading()
                 else -> {
                     BackHandler { open = null }
-                    Tracks(playlist) { error = it }
+                    Tracks(playlist, playlists.orEmpty().filter { it.owned && it.id != playlist.id }) { error = it }
                 }
             }
         }
@@ -157,27 +169,164 @@ private fun Loading() = Column(Modifier.fillMaxSize(), Arrangement.Center, Align
     CircularProgressIndicator()
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun Tracks(playlist: Playlist, onError: (String) -> Unit) {
+private fun Tracks(playlist: Playlist, targets: List<Playlist>, onError: (String) -> Unit) {
     var tracks by remember(playlist) { mutableStateOf<List<Track>?>(null) }
+    var reload by remember { mutableIntStateOf(0) }
+    var menuFor by remember { mutableStateOf<Track?>(null) }
+    var adding by remember { mutableStateOf<Track?>(null) }
+    var finding by remember { mutableStateOf(false) }
+    var public by remember(playlist) { mutableStateOf(playlist.public) }
     val playing by Playback.state.collectAsState()
-    LaunchedEffect(playlist) {
+    val scope = rememberCoroutineScope()
+    LaunchedEffect(playlist, reload) {
         runCatching { Spotify.tracks(playlist) }.onSuccess { tracks = it }.onFailure { onError(it.message ?: "Could not load songs") }
     }
     val list = tracks ?: return Loading()
-    LazyColumn {
-        items(list) { t ->
-            val current = t.uri == playing.uri
-            Column(
-                Modifier.fillMaxWidth()
-                    .clickable { Playback.play(playlist.uri, t.uri, onError) }
-                    .padding(16.dp, 10.dp)
-            ) {
-                Text(t.name, maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (current) MaterialTheme.colorScheme.primary else Color.Unspecified)
-                Text(t.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+    Column {
+        if (playlist.owned) {
+            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    if (public == false) "Private" else "Public", color = Color.Gray, fontSize = 13.sp,
+                    modifier = Modifier.padding(start = 8.dp).weight(1f),
+                )
+                TextButton(onClick = {
+                    val was = public
+                    val now = was == false
+                    public = now
+                    scope.launch {
+                        runCatching { Spotify.setPublic(playlist, now) }.onFailure { public = was; onError(it.message ?: "Could not change it") }
+                    }
+                }) { Text(if (public == false) "Make public" else "Make private") }
+                TextButton(onClick = { finding = true }) { Text("Find duplicates") }
+            }
+            HorizontalDivider()
+        }
+        LazyColumn {
+            items(list) { t ->
+                val current = t.uri == playing.uri
+                Box {
+                    Column(
+                        Modifier.fillMaxWidth()
+                            .combinedClickable(
+                                onClick = { Playback.play(playlist.uri, t.uri, onError) },
+                                onLongClick = { menuFor = t },
+                            )
+                            .padding(16.dp, 10.dp)
+                    ) {
+                        Text(t.name, maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (current) MaterialTheme.colorScheme.primary else Color.Unspecified)
+                        Text(t.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+                    }
+                    DropdownMenu(expanded = menuFor === t, onDismissRequest = { menuFor = null }) {
+                        DropdownMenuItem(text = { Text("Add to queue") }, onClick = { menuFor = null; Playback.queue(t.uri) })
+                        if (targets.isNotEmpty()) {
+                            DropdownMenuItem(text = { Text("Add to playlist…") }, onClick = { menuFor = null; adding = t })
+                        }
+                    }
+                }
             }
         }
     }
+    adding?.let { song -> AddToPlaylist(song, targets, onError) { adding = null } }
+    if (finding) FindDuplicates(playlist, list, onError, close = { finding = false }) { reload++ }
+}
+
+/** Picks one of the listener's playlists and adds [song], warning first if it is already there. */
+@Composable
+private fun AddToPlaylist(song: Track, targets: List<Playlist>, onError: (String) -> Unit, close: () -> Unit) {
+    val scope = rememberCoroutineScope()
+    var checking by remember { mutableStateOf(false) }
+    var duplicate by remember { mutableStateOf<Pair<Playlist, Track>?>(null) }
+    fun add(target: Playlist) = scope.launch {
+        runCatching { Spotify.add(target, listOf(song.uri)) }.onFailure { onError(it.message ?: "Could not add it") }
+        close()
+    }
+    val dup = duplicate
+    if (dup != null) {
+        val (target, existing) = dup
+        AlertDialog(
+            onDismissRequest = close,
+            title = { Text("Already in ${target.name}") },
+            text = { Text("\"${existing.name}\" by ${existing.artists} is already in this playlist. Add \"${song.name}\" anyway?") },
+            confirmButton = { TextButton(onClick = { add(target) }) { Text("Add anyway") } },
+            dismissButton = { TextButton(onClick = close) { Text("Don't add") } },
+        )
+        return
+    }
+    AlertDialog(
+        onDismissRequest = close,
+        title = { Text("Add to playlist") },
+        text = {
+            if (checking) Loading() else LazyColumn {
+                items(targets) { target ->
+                    Text(
+                        target.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.fillMaxWidth().clickable {
+                            checking = true
+                            scope.launch {
+                                val key = Dupes.key(song)
+                                runCatching { Spotify.tracks(target) }
+                                    .onSuccess { songs ->
+                                        val existing = songs.firstOrNull { Dupes.key(it) == key }
+                                        if (existing != null) duplicate = target to existing else add(target)
+                                    }
+                                    .onFailure { onError(it.message ?: "Could not read that playlist"); close() }
+                                checking = false
+                            }
+                        }.padding(vertical = 12.dp),
+                    )
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = close) { Text("Cancel") } },
+    )
+}
+
+/** Lists songs in [playlist] more than once; the copies after the first start ticked for removal. */
+@Composable
+private fun FindDuplicates(playlist: Playlist, tracks: List<Track>, onError: (String) -> Unit, close: () -> Unit, changed: () -> Unit) {
+    val groups = remember(tracks) { Dupes.groups(tracks) }
+    var remove by remember(tracks) { mutableStateOf(groups.flatMap { it.drop(1) }.toSet()) }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    AlertDialog(
+        onDismissRequest = { if (!busy) close() },
+        title = { Text(if (groups.isEmpty()) "No duplicates" else "Duplicates") },
+        text = {
+            if (groups.isEmpty()) Text("Every song in ${playlist.name} is there once.")
+            else LazyColumn {
+                groups.forEach { group ->
+                    item { HorizontalDivider() }
+                    items(group) { index ->
+                        val t = tracks[index]
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(index in remove, { remove = if (it) remove + index else remove - index }, enabled = !busy)
+                            Column {
+                                Text(t.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text("${t.artists} · #${index + 1}", maxLines = 1, color = Color.Gray, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            if (groups.isNotEmpty()) TextButton(enabled = !busy && remove.isNotEmpty(), onClick = {
+                busy = true
+                scope.launch {
+                    val (uris, readd) = Dupes.plan(tracks.map { it.uri }, remove)
+                    runCatching {
+                        Spotify.remove(playlist, uris)
+                        for ((uri, position) in readd) Spotify.add(playlist, listOf(uri), position)
+                    }.onFailure { onError(it.message ?: "Could not remove them") }
+                    changed()
+                    close()
+                }
+            }) { Text(if (busy) "Removing…" else "Remove ${remove.size}") }
+        },
+        dismissButton = { TextButton(enabled = !busy, onClick = close) { Text("Close") } },
+    )
 }
 
 @Composable
@@ -185,11 +334,18 @@ private fun NowPlaying() {
     val state by Playback.state.collectAsState()
     if (state.uri.isEmpty()) return
     var dragging by remember { mutableStateOf<Float?>(null) }
+    var upNext by remember { mutableStateOf(false) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
         HorizontalDivider()
         Spacer(Modifier.height(8.dp))
-        Text(state.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp)
-        Text(state.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(state.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp)
+                Text(state.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+            }
+            TextButton(onClick = { upNext = true }) { Text("Up next") }
+        }
+        Bars(state.playing)
         Slider(
             value = dragging ?: state.positionMs.toFloat(),
             valueRange = 0f..maxOf(1, state.durationMs).toFloat(),
@@ -204,6 +360,50 @@ private fun NowPlaying() {
             }
             TextButton(onClick = { Playback.command(Core.NEXT) }) { Text("⏭", fontSize = 24.sp) }
             Text(time(state.durationMs), color = Color.Gray, fontSize = 12.sp)
+        }
+    }
+    if (upNext) AlertDialog(
+        onDismissRequest = { upNext = false },
+        title = { Text("Up next") },
+        text = {
+            if (state.next.isEmpty()) Text("Nothing after this song.")
+            else LazyColumn {
+                items(state.next) { uri ->
+                    val t = Spotify.known[uri]
+                    Column(Modifier.padding(vertical = 6.dp)) {
+                        Text(t?.name ?: uri, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        t?.let { Text(it.artists, maxLines = 1, color = Color.Gray, fontSize = 12.sp) }
+                    }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = { upNext = false }) { Text("Done") } },
+    )
+}
+
+/** The visualizer: bars from the core's spectrum, about 30 times a second while playing. */
+@Composable
+private fun Bars(playing: Boolean) {
+    var levels by remember { mutableStateOf(FloatArray(0)) }
+    LaunchedEffect(playing) {
+        if (!playing) {
+            levels = FloatArray(0)
+            return@LaunchedEffect
+        }
+        while (true) {
+            val next = withContext(Dispatchers.Default) { Core.bands() }
+            // Rise at once, fall gently, like a classic analyser.
+            levels = FloatArray(next.size) { i -> maxOf(next[i], (levels.getOrNull(i) ?: 0f) - 0.04f) }
+            delay(33)
+        }
+    }
+    val color = MaterialTheme.colorScheme.primary
+    Canvas(Modifier.fillMaxWidth().height(36.dp).padding(vertical = 4.dp)) {
+        if (levels.isEmpty()) return@Canvas
+        val slot = size.width / levels.size
+        levels.forEachIndexed { i, level ->
+            val h = size.height * level.coerceIn(0.02f, 1f)
+            drawRect(color, topLeft = Offset(i * slot + slot * 0.15f, size.height - h), size = Size(slot * 0.7f, h))
         }
     }
 }
