@@ -1,0 +1,45 @@
+[package]
+name = "spotifast-android"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Its own workspace: the desktop crate above must not pick this up.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1"
+log = "0.4"
+serde_json = "1"
+jni = "0.21"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
+# The same librespot fork as the desktop app (see ../../Cargo.toml), with
+# webpki roots: Android's certificate store is not a file rustls can read.
+librespot-core = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-playback = { version = "0.8", default-features = false, features = ["rustls-tls-webpki-roots"] }
+librespot-connect = { version = "0.8", default-features = false }
+librespot-metadata = { version = "0.8", default-features = false }
+librespot-protocol = { version = "0.8", default-features = false }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.15"
+
+[patch.crates-io]
+librespot-audio = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+librespot-connect = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+librespot-core = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+librespot-metadata = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+librespot-oauth = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+librespot-playback = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+librespot-protocol = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca4811371ddae81c06be168de54194938d70b1" }
