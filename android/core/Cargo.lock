@@ -2355,6 +2355,7 @@ dependencies = [
  "librespot-protocol",
  "log",
  "serde_json",
+ "sha1",
  "tokio",
 ]
 

@@ -36,6 +36,18 @@ use librespot_playback::mixer::{self, MixerConfig};
 use librespot_playback::player::{Player, PlayerEvent};
 use librespot_playback::SAMPLE_RATE;
 
+/// The client the playback grant belongs to (src/auth.rs on the desktop).
+const PLAYBACK_CLIENT_ID: &str = "65b708073fc0480ea92a077233ca87bd";
+
+/// The desktop's device ID: the SHA-1 of the device name, in hex.
+fn device_id(name: &str) -> String {
+    use sha1::{Digest, Sha1};
+    Sha1::digest(name.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -192,7 +204,16 @@ fn connect(
         let _ = old.shutdown();
     }
     RUNTIME.block_on(async move {
-        let session = Session::new(SessionConfig::default(), Some(cache));
+        // librespot picks Spotify's Android client ID when built for Android,
+        // but the playback grant is issued to the desktop client: login5 then
+        // refuses it with INVALID_CREDENTIALS. A stable device ID, as on the
+        // desktop, keeps the saved credentials and the Connect device the same.
+        let session_config = SessionConfig {
+            client_id: PLAYBACK_CLIENT_ID.to_string(),
+            device_id: device_id(&device_name),
+            ..SessionConfig::default()
+        };
+        let session = Session::new(session_config, Some(cache));
         let mixer = mixer::find(Some("softvol")).ok_or_else(|| anyhow::anyhow!("no mixer"))?(
             MixerConfig::default(),
         )?;
