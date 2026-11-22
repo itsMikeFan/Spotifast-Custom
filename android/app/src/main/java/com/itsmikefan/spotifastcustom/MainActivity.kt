@@ -7,6 +7,13 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import coil.compose.AsyncImage
+import org.json.JSONObject
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -101,7 +108,8 @@ private fun SignIn(done: () -> Unit) {
                 Spotify.clientId = clientId
                 scope.launch {
                     runCatching { Spotify.signIn(context) }
-                        .onSuccess { webDone = true }
+                        // Asked again for new permissions: playback is already allowed.
+                        .onSuccess { if (Playback.hasPlaybackSignIn) done() else webDone = true }
                         .onFailure { error = it.message }
                     busy = false
                 }
@@ -129,13 +137,25 @@ private fun Library(signOut: () -> Unit) {
     var open by remember { mutableStateOf<Playlist?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
     var effects by remember { mutableStateOf(false) }
+    var devices by remember { mutableStateOf(false) }
+    var remote by remember { mutableStateOf<Remote?>(null) }
+    val local by Playback.state.collectAsState()
     LaunchedEffect(Unit) {
         runCatching { Spotify.playlists() }.onSuccess { playlists = it }.onFailure { error = it.message }
+    }
+    // What plays on another device, while this phone is not playing.
+    LaunchedEffect(Unit) {
+        while (true) {
+            remote = if (Playback.state.value.playing) null
+            else runCatching { Spotify.remote() }.getOrNull()?.takeIf { it.device != Playback.deviceName }
+            delay(3000)
+        }
     }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             if (open != null) TextButton(onClick = { open = null }) { Text("‹ Back") }
             Text(open?.name ?: "Your library", fontSize = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            TextButton(onClick = { devices = true }) { Text("Devices") }
             TextButton(onClick = { effects = true }) { Text("Effects") }
             if (open == null) TextButton(onClick = signOut) { Text("Sign out") }
         }
@@ -146,8 +166,9 @@ private fun Library(signOut: () -> Unit) {
                 null -> playlists?.let { list ->
                     LazyColumn {
                         items(list) { p ->
-                            Row(Modifier.fillMaxWidth().clickable { open = p }.padding(16.dp, 14.dp)) {
-                                Text(p.name, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            Row(Modifier.fillMaxWidth().clickable { open = p }.padding(16.dp, 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                                Cover(p.cover)
+                                Text(p.name, Modifier.weight(1f).padding(start = 12.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 if (p.count >= 0) Text("${p.count}", color = Color.Gray)
                             }
                         }
@@ -163,9 +184,11 @@ private fun Library(signOut: () -> Unit) {
                 }
             }
         }
-        NowPlaying()
+        val elsewhere = remote
+        if (elsewhere != null && !local.playing) RemoteBar(elsewhere) { remote = it } else NowPlaying()
     }
     if (effects) EffectsDialog { effects = false }
+    if (devices) DevicesDialog { devices = false }
 }
 
 @Composable
@@ -216,16 +239,20 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
             items(list) { t ->
                 val current = t.uri == playing.uri
                 Box {
-                    Column(
+                    Row(
                         Modifier.fillMaxWidth()
                             .combinedClickable(
                                 onClick = { Playback.play(playlist.uri, t.uri, onError) },
                                 onLongClick = { menuFor = t },
                             )
-                            .padding(16.dp, 10.dp)
+                            .padding(16.dp, 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Text(t.name, maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (current) MaterialTheme.colorScheme.primary else Color.Unspecified)
-                        Text(t.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+                        Cover(t.cover)
+                        Column(Modifier.padding(start = 12.dp)) {
+                            Text(t.name, maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (current) MaterialTheme.colorScheme.primary else Color.Unspecified)
+                            Text(t.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+                        }
                     }
                     DropdownMenu(expanded = menuFor === t, onDismissRequest = { menuFor = null }) {
                         DropdownMenuItem(text = { Text("Add to queue") }, onClick = { menuFor = null; Playback.queue(t.uri) })
@@ -348,7 +375,8 @@ private fun NowPlaying() {
         HorizontalDivider()
         Spacer(Modifier.height(8.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(Modifier.weight(1f)) {
+            Cover(Spotify.known[state.uri]?.cover)
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
                 Text(state.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp)
                 Text(state.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
             }
@@ -387,6 +415,140 @@ private fun NowPlaying() {
             }
         },
         confirmButton = { TextButton(onClick = { upNext = false }) { Text("Done") } },
+    )
+}
+
+@Composable
+private fun Cover(url: String?) {
+    AsyncImage(
+        model = url, contentDescription = null, contentScale = ContentScale.Crop,
+        modifier = Modifier.size(44.dp).clip(RoundedCornerShape(4.dp)).background(Color.DarkGray),
+    )
+}
+
+/** Controls for what plays on another device, through the Web API. */
+@Composable
+private fun RemoteBar(remote: Remote, changed: (Remote) -> Unit) {
+    val scope = rememberCoroutineScope()
+    fun send(command: Int) = scope.launch {
+        runCatching { Spotify.remoteCommand(command) }
+        delay(500)
+        runCatching { Spotify.remote() }.getOrNull()?.let(changed)
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        HorizontalDivider()
+        Spacer(Modifier.height(8.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Cover(remote.cover)
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text(remote.name, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 16.sp)
+                Text(remote.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+                Text("Playing on ${remote.device}", maxLines = 1, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
+            }
+        }
+        Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly, Alignment.CenterVertically) {
+            TextButton(onClick = { send(Core.PREVIOUS) }) { Text("⏮", fontSize = 24.sp) }
+            TextButton(onClick = { changed(remote.copy(playing = !remote.playing)); send(if (remote.playing) Core.PAUSE else Core.PLAY) }) {
+                Text(if (remote.playing) "⏸" else "▶", fontSize = 28.sp)
+            }
+            TextButton(onClick = { send(Core.NEXT) }) { Text("⏭", fontSize = 24.sp) }
+        }
+    }
+}
+
+/** Spotify Connect devices, plus Connect and Cast speakers found on the network; tapping one moves playback there. */
+@Composable
+private fun DevicesDialog(close: () -> Unit) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    var devices by remember { mutableStateOf<List<Device>?>(null) }
+    var nearby by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var searching by remember { mutableStateOf(true) }
+    var status by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) {
+        runCatching { Spotify.devices() }.onSuccess { devices = it }.onFailure { status = it.message; devices = emptyList() }
+        val found = withContext(Dispatchers.IO) {
+            // Android drops multicast unless an app holds this lock.
+            val wifi = context.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
+            val lock = wifi?.createMulticastLock("spotifast:discovery")?.apply { setReferenceCounted(false); acquire() }
+            try { Core.receivers(3000) } finally { lock?.release() }
+        }
+        runCatching {
+            val array = org.json.JSONArray(found ?: "[]")
+            nearby = (0 until array.length()).map { array.getJSONObject(it) }
+        }.onFailure { status = runCatching { JSONObject(found ?: "").optString("error") }.getOrNull() ?: it.message }
+        searching = false
+    }
+    fun move(id: String, name: String) {
+        status = "Moving playback to $name…"
+        scope.launch {
+            runCatching { Spotify.transfer(id) }
+                .onSuccess { close() }
+                .onFailure { status = "Could not move playback to $name: ${it.message}" }
+        }
+    }
+    fun start(row: JSONObject) {
+        val name = row.optString("name")
+        status = "Starting Spotify on $name…"
+        scope.launch {
+            Playback.connect()?.let { status = it; return@launch }
+            val failed = withContext(Dispatchers.IO) { Core.activate(row.toString()) }
+            if (failed != null) {
+                status = "Could not start $name: $failed"
+                return@launch
+            }
+            // The speaker joins Spotify Connect a moment after it signs in.
+            val id = row.optString("device_id")
+            repeat(15) {
+                val listed = runCatching { Spotify.devices() }.getOrNull().orEmpty()
+                listed.firstOrNull { it.id == id || it.name == name }?.let { move(it.id, name); return@launch }
+                delay(1000)
+            }
+            status = "$name started but did not show up in Spotify. Try again in a moment."
+        }
+    }
+    val listed = devices.orEmpty()
+    val extra = nearby.filter { row -> listed.none { it.id == row.optString("device_id") || it.name == row.optString("name") } }
+    AlertDialog(
+        onDismissRequest = close,
+        title = { Text("Play on") },
+        text = {
+            Column {
+                status?.let { Text(it, fontSize = 13.sp, color = Color.Gray, modifier = Modifier.padding(bottom = 8.dp)) }
+                if (devices == null) Loading() else LazyColumn {
+                    items(listed) { d ->
+                        val here = d.name == Playback.deviceName
+                        Column(Modifier.fillMaxWidth().clickable {
+                            if (here) scope.launch { Playback.connect()?.let { status = it } ?: move(d.id, d.name) } else move(d.id, d.name)
+                        }.padding(vertical = 10.dp)) {
+                            Text(if (here) "This phone" else d.name, color = if (d.active) MaterialTheme.colorScheme.primary else Color.Unspecified)
+                            Text(d.type + if (d.active) " · playing" else "", fontSize = 12.sp, color = Color.Gray)
+                        }
+                    }
+                    if (listed.none { it.name == Playback.deviceName }) item {
+                        Column(Modifier.fillMaxWidth().clickable {
+                            scope.launch {
+                                Playback.connect()?.let { status = it; return@launch }
+                                delay(1500)
+                                runCatching { Spotify.devices() }.getOrNull()?.firstOrNull { it.name == Playback.deviceName }
+                                    ?.let { move(it.id, "this phone") } ?: run { status = "This phone is ready. Pick it again in a moment." }
+                            }
+                        }.padding(vertical = 10.dp)) {
+                            Text("This phone")
+                            Text("Spotifast", fontSize = 12.sp, color = Color.Gray)
+                        }
+                    }
+                    items(extra) { row ->
+                        Column(Modifier.fillMaxWidth().clickable { start(row) }.padding(vertical = 10.dp)) {
+                            Text(row.optString("name"))
+                            Text(if (row.optBoolean("cast")) "Google Cast" else "Spotify Connect on this network", fontSize = 12.sp, color = Color.Gray)
+                        }
+                    }
+                    if (searching) item { Text("Looking for speakers on this network…", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(vertical = 10.dp)) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onClick = close) { Text("Close") } },
     )
 }
 

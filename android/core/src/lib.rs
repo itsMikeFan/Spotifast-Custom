@@ -15,6 +15,11 @@ mod limiter;
 #[path = "../../../src/resample.rs"]
 mod resample;
 mod vis;
+// The desktop's Google Cast and Spotify Connect receiver activation.
+#[path = "../../../src/cast.rs"]
+mod cast;
+#[path = "../../../src/zeroconf.rs"]
+mod zeroconf;
 
 use std::sync::{LazyLock, Mutex};
 use std::time::Instant;
@@ -56,6 +61,8 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
         .expect("tokio runtime")
 });
 static SPIRC: Mutex<Option<Spirc>> = Mutex::new(None);
+/// The connected session, which Cast activation borrows the account from.
+static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 static EFFECTS: LazyLock<effects::SharedEffects> = LazyLock::new(effects::shared);
 
@@ -244,7 +251,8 @@ fn connect(
             device_type: DeviceType::Smartphone,
             ..ConnectConfig::default()
         };
-        let (spirc, task) = Spirc::new(config, session, credentials, player, mixer).await?;
+        let (spirc, task) = Spirc::new(config, session.clone(), credentials, player, mixer).await?;
+        *SESSION.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
         *SPIRC.lock().unwrap_or_else(|p| p.into_inner()) = Some(spirc);
         state().connected = true;
         tokio::spawn(async move {
@@ -474,6 +482,117 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_state<'a>(
     env.new_string(json)
         .map(|s| s.into_raw())
         .unwrap_or(std::ptr::null_mut())
+}
+
+/// Spotify Connect and Google Cast receivers on the local network, as JSON.
+/// Blocks for `timeout_ms`; Kotlin holds a multicast lock meanwhile.
+fn receivers(timeout_ms: u64) -> anyhow::Result<String> {
+    let found = zeroconf::discover(std::time::Duration::from_millis(timeout_ms))?;
+    let found = zeroconf::resolve_receivers(found)?;
+    let rows: Vec<serde_json::Value> = found
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "name": r.name,
+                "device_id": r.device_id.clone().unwrap_or_else(|| if r.cast { cast::device_id(&r.name) } else { String::new() }),
+                "address": r.address.to_string(),
+                "port": r.port,
+                "path": r.path,
+                "cast": r.cast,
+            })
+        })
+        .collect();
+    Ok(serde_json::Value::Array(rows).to_string())
+}
+
+/// Starts Spotify on a receiver from [`receivers`] and signs it in with this
+/// session's account, as the desktop's `activate_cast` and `activate_receiver`
+/// do. It then joins Spotify Connect and can be transferred to.
+fn activate(json: &str) -> anyhow::Result<()> {
+    let row: serde_json::Value = serde_json::from_str(json)?;
+    let text = |key: &str| row[key].as_str().unwrap_or_default().to_string();
+    let receiver = zeroconf::Receiver {
+        name: text("name"),
+        device_id: Some(text("device_id")).filter(|id| !id.is_empty()),
+        address: text("address").parse()?,
+        port: row["port"].as_u64().unwrap_or_default() as u16,
+        path: text("path"),
+        cast: row["cast"].as_bool().unwrap_or_default(),
+    };
+    let session = SESSION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Play something on this phone first, so there is an account to hand over"
+            )
+        })?;
+    if receiver.cast {
+        return cast::start(
+            receiver.address,
+            receiver.port,
+            &receiver.name,
+            |client, device| RUNTIME.block_on(cast::device_token(&session, client, device)),
+        );
+    }
+    let stored = session
+        .cache()
+        .and_then(|cache| cache.credentials())
+        .ok_or_else(|| anyhow::anyhow!("no saved playback sign-in to hand over"))?;
+    let http = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()?;
+    let info = zeroconf::get_info(&http, &receiver)?;
+    zeroconf::add_user(
+        &http,
+        &receiver,
+        &info,
+        &zeroconf::Credentials::from_playback(&stored)?,
+        "Spotifast Custom",
+    )
+}
+
+fn java_string(env: &JNIEnv, text: Option<String>) -> jstring {
+    match text {
+        None => JObject::null().into_raw(),
+        Some(text) => env
+            .new_string(text)
+            .map(|s| s.into_raw())
+            .unwrap_or(std::ptr::null_mut()),
+    }
+}
+
+/// JSON array of receivers, or `{"error": ...}`.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_receivers<'a>(
+    env: JNIEnv<'a>,
+    _this: JObject<'a>,
+    timeout_ms: jint,
+) -> jstring {
+    let json = guard(None, || {
+        Some(receivers(timeout_ms.max(0) as u64).unwrap_or_else(|error| {
+            serde_json::json!({ "error": format!("{error:#}") }).to_string()
+        }))
+    });
+    java_string(&env, json)
+}
+
+/// Returns null once the receiver is signed in, or why it failed.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_activate<'a>(
+    mut env: JNIEnv<'a>,
+    _this: JObject<'a>,
+    receiver: JString<'a>,
+) -> jstring {
+    let Some(receiver) = string(&mut env, &receiver) else {
+        return JObject::null().into_raw();
+    };
+    let error = guard(Some("native panic".to_string()), || {
+        activate(&receiver).err().map(|error| format!("{error:#}"))
+    });
+    java_string(&env, error)
 }
 
 #[cfg(test)]

@@ -22,6 +22,12 @@ object Core {
     /** Adds a song to Spotify's queue, after the current one. */
     external fun queue(uri: String)
 
+    /** Spotify Connect and Cast receivers on the network as a JSON array, or {"error": ...}. Blocks for [timeoutMs]. */
+    external fun receivers(timeoutMs: Int): String?
+
+    /** Starts Spotify on a receiver row from [receivers] and signs it in; null on success, else why not. */
+    external fun activate(receiver: String): String?
+
     /** The visualizer's bar heights, 0 to 1. */
     external fun bands(): FloatArray
 

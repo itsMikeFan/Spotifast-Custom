@@ -21,9 +21,15 @@ import java.security.SecureRandom
 
 data class Playlist(
     val name: String, val uri: String, val tracksPath: String, val count: Int,
-    val id: String = "", val owned: Boolean = false, val public: Boolean? = null,
+    val id: String = "", val owned: Boolean = false, val public: Boolean? = null, val cover: String? = null,
 )
-data class Track(val uri: String, val name: String, val artists: String, val lead: String, val durationMs: Int)
+data class Track(
+    val uri: String, val name: String, val artists: String, val lead: String, val durationMs: Int,
+    val cover: String? = null,
+)
+data class Device(val id: String, val name: String, val type: String, val active: Boolean)
+/** What plays on another Spotify Connect device. */
+data class Remote(val device: String, val playing: Boolean, val name: String, val artists: String, val cover: String?)
 
 /**
  * Sign-in and the Web API, the same two grants as the desktop's src/auth.rs:
@@ -38,6 +44,7 @@ object Spotify {
     private val WEB_SCOPES = listOf(
         "playlist-read-private", "playlist-read-collaborative", "playlist-modify-private",
         "playlist-modify-public", "user-library-read", "user-library-modify", "user-read-private",
+        "user-read-playback-state", "user-modify-playback-state",
     )
 
     private lateinit var prefs: android.content.SharedPreferences
@@ -52,7 +59,8 @@ object Spotify {
         get() = prefs.getString("client_id", "") ?: ""
         set(value) = prefs.edit().putString("client_id", value.trim()).apply()
 
-    val signedIn get() = prefs.contains("refresh_token")
+    // A sign-in from before the device scopes were asked for counts as signed out, so step 1 asks again.
+    val signedIn get() = prefs.contains("refresh_token") && prefs.getString("scopes", "") == WEB_SCOPES.joinToString(" ")
     val userId get() = prefs.getString("user_id", "") ?: ""
 
     fun signOut() = prefs.edit().remove("refresh_token").remove("access_token").remove("user_id").apply()
@@ -62,7 +70,7 @@ object Spotify {
         val token = authorize(context, clientId, WEB_PORT, WEB_SCOPES, showDialog = false)
         save(token)
         val me = get("/me")
-        prefs.edit().putString("user_id", me.getString("id")).apply()
+        prefs.edit().putString("user_id", me.getString("id")).putString("scopes", WEB_SCOPES.joinToString(" ")).apply()
     }
 
     /** Browser sign-in for playback; returns the streaming access token for the core. */
@@ -177,7 +185,9 @@ object Spotify {
     /** A Web API request, refreshing the token once on 401 and waiting once on 429. Returns the JSON body, if any. */
     private suspend fun call(method: String, path: String, body: JSONObject?): JSONObject? = withContext(Dispatchers.IO) {
         val url = if (path.startsWith("https://")) path else "https://api.spotify.com/v1$path"
-        val payload = body?.toString()?.toRequestBody("application/json".toMediaType())
+        // OkHttp needs a body for PUT and POST, even an empty one.
+        val payload = (body?.toString() ?: if (method == "PUT" || method == "POST") "" else null)
+            ?.toRequestBody("application/json".toMediaType())
         var refreshed = false
         var waited = false
         while (true) {
@@ -238,7 +248,7 @@ object Spotify {
                 val public = if (p.isNull("public")) null else p.optBoolean("public")
                 result += Playlist(
                     p.optString("name"), p.getString("uri"), "/playlists/$id/items?limit=50", count,
-                    id, owner == userId, public,
+                    id, owner == userId, public, image(p.optJSONArray("images")),
                 )
             }
             next = page.optString("next").takeIf { it.isNotEmpty() && it != "null" }
@@ -259,13 +269,52 @@ object Spotify {
                 val names = t.optJSONArray("artists")?.let { a ->
                     (0 until a.length()).map { a.getJSONObject(it).optString("name") }
                 } ?: emptyList()
-                val track = Track(uri, t.optString("name"), names.joinToString(", "), names.firstOrNull() ?: "", t.optInt("duration_ms"))
+                val track = Track(
+                    uri, t.optString("name"), names.joinToString(", "), names.firstOrNull() ?: "", t.optInt("duration_ms"),
+                    image(t.optJSONObject("album")?.optJSONArray("images")),
+                )
                 known[uri] = track
                 result += track
             }
             next = page.optString("next").takeIf { it.isNotEmpty() && it != "null" }
         }
         return result
+    }
+
+    /** The smallest image, which is plenty for a row; Spotify lists the largest first. */
+    private fun image(images: JSONArray?): String? =
+        images?.takeIf { it.length() > 0 }?.let { it.optJSONObject(it.length() - 1) }?.optString("url")?.takeIf { it.isNotEmpty() }
+
+    suspend fun devices(): List<Device> {
+        val list = get("/me/player/devices").optJSONArray("devices") ?: return emptyList()
+        return (0 until list.length()).map { list.getJSONObject(it) }.filter { !it.isNull("id") }.map {
+            Device(it.getString("id"), it.optString("name"), it.optString("type"), it.optBoolean("is_active"))
+        }
+    }
+
+    suspend fun transfer(deviceId: String) {
+        call("PUT", "/me/player", JSONObject().put("device_ids", JSONArray(listOf(deviceId))).put("play", true))
+    }
+
+    /** What plays now on whichever device is active, or null when nothing is. */
+    suspend fun remote(): Remote? {
+        val o = call("GET", "/me/player", null) ?: return null
+        val item = o.optJSONObject("item") ?: return null
+        val artists = item.optJSONArray("artists")?.let { a -> (0 until a.length()).joinToString(", ") { a.getJSONObject(it).optString("name") } } ?: ""
+        return Remote(
+            o.optJSONObject("device")?.optString("name") ?: "", o.optBoolean("is_playing"), item.optString("name"), artists,
+            image(item.optJSONObject("album")?.optJSONArray("images")),
+        )
+    }
+
+    /** Play, pause, next or previous on the active device. */
+    suspend fun remoteCommand(command: Int) {
+        when (command) {
+            Core.PLAY -> call("PUT", "/me/player/play", null)
+            Core.PAUSE -> call("PUT", "/me/player/pause", null)
+            Core.NEXT -> call("POST", "/me/player/next", null)
+            Core.PREVIOUS -> call("POST", "/me/player/previous", null)
+        }
     }
 
     private fun enc(value: String) = URLEncoder.encode(value, "UTF-8").replace("+", "%20")

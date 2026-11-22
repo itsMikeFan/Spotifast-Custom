@@ -28,6 +28,24 @@ librespot-connect = { version = "0.8", default-features = false }
 librespot-metadata = { version = "0.8", default-features = false }
 librespot-protocol = { version = "0.8", default-features = false }
 
+# For the desktop's Cast and Spotify Connect receiver code (src/cast.rs,
+# src/zeroconf.rs), the same versions the desktop uses.
+serde = { version = "1", features = ["derive"] }
+protobuf = "3"
+md-5 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
+ring = "0.17"
+thiserror = "2"
+rand = "0.9"
+pbkdf2 = "0.12"
+base64 = "0.22"
+hmac = "0.12"
+aes = "0.8"
+ctr = "0.9"
+mdns-sd = "0.21"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-webpki-roots", "json", "blocking"] }
+
 [target.'cfg(target_os = "android")'.dependencies]
 android_logger = "0.15"
 
@@ -44,7 +62,6 @@ librespot-protocol = { git = "https://github.com/crmne/librespot", rev = "3ba977
 lto = "thin"
 codegen-units = 1
 strip = true
-hyper-proxy2 = { git = "https://github.com/crmne/hyper-proxy2", rev = "efca4811371ddae81c06be168de54194938d70b1" }
 
 # The other librespot crates reach librespot-core by path inside the fork's
 # git checkout; point those at the vendored copy too, so one copy exists.

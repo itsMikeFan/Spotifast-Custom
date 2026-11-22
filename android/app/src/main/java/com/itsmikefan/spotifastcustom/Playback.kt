@@ -54,6 +54,9 @@ object Playback {
     private val out by lazy { AudioOut() }
     private lateinit var app: Context
 
+    /** How this phone shows in Spotify Connect. */
+    val deviceName = "Spotifast Custom (${Build.MODEL})"
+
     private val cacheDir get() = File(app.filesDir, "librespot").path
     /** librespot keeps a reusable playback sign-in here after the first one. */
     val hasPlaybackSignIn get() = File(cacheDir, "credentials.json").exists()
@@ -91,7 +94,7 @@ object Playback {
     suspend fun connect(token: String? = null): String? = connecting.withLock {
         if (token == null && state.value.connected) return null
         withContext(Dispatchers.IO) {
-            Core.connect(out, cacheDir, token, "Spotifast Custom (${Build.MODEL})")
+            Core.connect(out, cacheDir, token, deviceName)
         }.also { if (it == null) state.value = state.value.copy(connected = true) }
     }
 
