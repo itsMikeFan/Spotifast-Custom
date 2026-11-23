@@ -349,7 +349,9 @@ impl log::Log for Logger {
     fn log(&self, record: &log::Record) {
         #[cfg(target_os = "android")]
         log::Log::log(&self.android, record);
-        if record.level() <= log::Level::Warn && record.target().starts_with("librespot") {
+        // Only a refused audio key stops a song for good; librespot's other
+        // warnings (dropped websockets, missing context info) it recovers from.
+        if record.level() <= log::Level::Warn && record.target().ends_with("audio_key") {
             // try_lock: the state's own holders may log, and a missed message beats a deadlock.
             if let Ok(mut state) = STATE.try_lock() {
                 state.error = record.args().to_string();
