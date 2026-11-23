@@ -63,6 +63,8 @@ static RUNTIME: LazyLock<tokio::runtime::Runtime> = LazyLock::new(|| {
 static SPIRC: Mutex<Option<Spirc>> = Mutex::new(None);
 /// The connected session, which Cast activation borrows the account from.
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
+/// The player behind [SPIRC], kept to preload the song a load starts with.
+static PLAYER: Mutex<Option<std::sync::Arc<Player>>> = Mutex::new(None);
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 static EFFECTS: LazyLock<effects::SharedEffects> = LazyLock::new(effects::shared);
 
@@ -246,9 +248,14 @@ fn connect(
             },
         );
         tokio::spawn(follow(player.get_player_event_channel()));
+        *PLAYER.lock().unwrap_or_else(|p| p.into_inner()) = Some(player.clone());
         let config = ConnectConfig {
             name: device_name,
             device_type: DeviceType::Smartphone,
+            // librespot starts at half volume, which is far quieter on its
+            // log curve; the phone's own volume keys set loudness instead.
+            initial_volume: u16::MAX,
+            disable_volume: true,
             ..ConnectConfig::default()
         };
         let (spirc, task) = Spirc::new(config, session.clone(), credentials, player, mixer).await?;
@@ -370,6 +377,14 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_load<'a>(
     };
     let track = string(&mut env, &track);
     guard((), || {
+        // As on the desktop: librespot resolves the whole playlist before it
+        // fetches the song, so fetch the song now and the load picks it up.
+        if let Some(uri) = track.as_deref().filter(|t| t.starts_with("spotify:track:"))
+            && let Ok(uri) = librespot_core::SpotifyUri::from_uri(uri)
+            && let Some(player) = PLAYER.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
+        {
+            player.preload(uri);
+        }
         spirc(|spirc| {
             spirc.activate()?;
             spirc.load(LoadRequest::from_context_uri(

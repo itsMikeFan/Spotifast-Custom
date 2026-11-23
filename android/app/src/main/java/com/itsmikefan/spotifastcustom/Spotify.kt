@@ -5,6 +5,9 @@ import android.content.Intent
 import android.net.Uri
 import android.util.Base64
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -233,7 +236,7 @@ object Spotify {
     }
 
     suspend fun playlists(): List<Playlist> {
-        val liked = Playlist("Liked Songs", "spotify:user:$userId:collection", "/me/tracks?limit=50", -1)
+        val liked = Playlist("Liked Songs", "spotify:user:$userId:collection", "/me/tracks?limit=50&market=from_token", -1)
         val result = mutableListOf(liked)
         var next: String? = "/me/playlists?limit=50"
         while (next != null) {
@@ -247,7 +250,7 @@ object Spotify {
                 val owner = p.optJSONObject("owner")?.optString("id")
                 val public = if (p.isNull("public")) null else p.optBoolean("public")
                 result += Playlist(
-                    p.optString("name"), p.getString("uri"), "/playlists/$id/items?limit=50", count,
+                    p.optString("name"), p.getString("uri"), "/playlists/$id/items?limit=50&market=from_token&fields=$ITEM_FIELDS", count,
                     id, owner == userId, public, image(p.optJSONArray("images")),
                 )
             }
@@ -256,29 +259,55 @@ object Spotify {
         return result
     }
 
-    suspend fun tracks(playlist: Playlist): List<Track> {
-        val result = mutableListOf<Track>()
-        var next: String? = playlist.tracksPath
-        while (next != null) {
-            val page = get(next)
-            val items = page.getJSONArray("items")
-            for (i in 0 until items.length()) {
-                val row = items.optJSONObject(i) ?: continue
-                val t = row.optJSONObject("item") ?: row.optJSONObject("track") ?: continue
-                val uri = t.optString("uri").takeIf { it.isNotEmpty() } ?: continue
-                val names = t.optJSONArray("artists")?.let { a ->
-                    (0 until a.length()).map { a.getJSONObject(it).optString("name") }
-                } ?: emptyList()
-                val track = Track(
-                    uri, t.optString("name"), names.joinToString(", "), names.firstOrNull() ?: "", t.optInt("duration_ms"),
-                    image(t.optJSONObject("album")?.optJSONArray("images")),
-                )
-                known[uri] = track
-                result += track
-            }
-            next = page.optString("next").takeIf { it.isNotEmpty() && it != "null" }
+    /**
+     * Every song in [playlist]. The first page goes to [onPage] at once and the
+     * rest follow a few pages at a time, fetched side by side, so a long
+     * playlist shows its top while the remainder loads.
+     */
+    suspend fun tracks(playlist: Playlist, onPage: (List<Track>) -> Unit = {}): List<Track> = coroutineScope {
+        val first = get(playlist.tracksPath)
+        val result = songs(first).toMutableList()
+        onPage(result.toList())
+        val total = first.optInt("total", result.size)
+        val offsets = (PAGE until total step PAGE).toList()
+        for (batch in offsets.chunked(4)) {
+            batch.map { offset -> async { songs(get("${playlist.tracksPath}&offset=$offset")) } }
+                .awaitAll().forEach { result += it }
+            onPage(result.toList())
         }
-        return result
+        result
+    }
+
+    private const val PAGE = 50
+    /** Only what a song row needs; without it every song carries its full album and market list. */
+    private val ITEM_FIELDS = "uri,name,duration_ms,artists(name),album(images)".let { song ->
+        URLEncoder.encode("total,next,items(item($song),track($song))", "UTF-8")
+    }
+
+    private fun songs(page: JSONObject): List<Track> {
+        val items = page.optJSONArray("items") ?: return emptyList()
+        return (0 until items.length()).mapNotNull { i ->
+            val row = items.optJSONObject(i) ?: return@mapNotNull null
+            song(row.optJSONObject("item") ?: row.optJSONObject("track") ?: return@mapNotNull null)
+        }
+    }
+
+    private fun song(t: JSONObject): Track? {
+        val uri = t.optString("uri").takeIf { it.isNotEmpty() } ?: return null
+        val names = t.optJSONArray("artists")?.let { a ->
+            (0 until a.length()).map { a.getJSONObject(it).optString("name") }
+        } ?: emptyList()
+        return Track(
+            uri, t.optString("name"), names.joinToString(", "), names.firstOrNull() ?: "", t.optInt("duration_ms"),
+            image(t.optJSONObject("album")?.optJSONArray("images")),
+        ).also { known[uri] = it }
+    }
+
+    /** A song Spotify queued that no loaded playlist holds, such as one queued in the Spotify app. */
+    suspend fun lookup(uri: String): Track? {
+        known[uri]?.let { return it }
+        val id = uri.removePrefix("spotify:track:").takeIf { it != uri } ?: return null
+        return runCatching { song(get("/tracks/$id?market=from_token")) }.getOrNull()
     }
 
     /** The smallest image, which is plenty for a row; Spotify lists the largest first. */

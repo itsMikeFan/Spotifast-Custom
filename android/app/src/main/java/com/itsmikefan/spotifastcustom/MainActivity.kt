@@ -200,6 +200,7 @@ private fun Loading() = Column(Modifier.fillMaxSize(), Arrangement.Center, Align
 @Composable
 private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boolean) -> Unit, onError: (String) -> Unit) {
     var tracks by remember(playlist.id) { mutableStateOf<List<Track>?>(null) }
+    var complete by remember(playlist.id) { mutableStateOf(false) }
     var reload by remember { mutableIntStateOf(0) }
     var menuFor by remember { mutableStateOf<Track?>(null) }
     var adding by remember { mutableStateOf<Track?>(null) }
@@ -208,7 +209,8 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
     val playing by Playback.state.collectAsState()
     val scope = rememberCoroutineScope()
     LaunchedEffect(playlist.id, reload) {
-        runCatching { Spotify.tracks(playlist) }.onSuccess { tracks = it }.onFailure { onError(it.message ?: "Could not load songs") }
+        complete = false
+        runCatching { Spotify.tracks(playlist) { tracks = it } }.onSuccess { tracks = it; complete = true }.onFailure { onError(it.message ?: "Could not load songs") }
     }
     val list = tracks ?: return Loading()
     Column {
@@ -231,7 +233,8 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
                         }
                     }
                 }) { Text(if (public == false) "Make public" else "Make private") }
-                TextButton(onClick = { finding = true }) { Text("Find duplicates") }
+                // It needs every song, so it waits for the rest to load.
+                TextButton(onClick = { finding = true }, enabled = complete) { Text("Find duplicates") }
             }
             HorizontalDivider()
         }
@@ -371,6 +374,8 @@ private fun NowPlaying() {
     if (state.uri.isEmpty()) return
     var dragging by remember { mutableStateOf<Float?>(null) }
     var upNext by remember { mutableStateOf(false) }
+    // Names its cover when the song came from Spotify's queue; the 500 ms poll redraws it.
+    LaunchedEffect(state.uri) { Spotify.lookup(state.uri) }
     Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
         HorizontalDivider()
         Spacer(Modifier.height(8.dp))
@@ -406,10 +411,13 @@ private fun NowPlaying() {
             if (state.next.isEmpty()) Text("Nothing after this song.")
             else LazyColumn {
                 items(state.next) { uri ->
-                    val t = Spotify.known[uri]
+                    var t by remember(uri) { mutableStateOf(Spotify.known[uri]) }
+                    // Songs queued in the Spotify app come over as bare URIs.
+                    var looked by remember(uri) { mutableStateOf(false) }
+                    if (t == null) LaunchedEffect(uri) { t = Spotify.lookup(uri); looked = true }
                     Column(Modifier.padding(vertical = 6.dp)) {
-                        Text(t?.name ?: uri, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        t?.let { Text(it.artists, maxLines = 1, color = Color.Gray, fontSize = 12.sp) }
+                        Text(t?.name ?: if (looked) uri else "…", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                        t?.let { s -> Text(s.artists, maxLines = 1, color = Color.Gray, fontSize = 12.sp) }
                     }
                 }
             }
