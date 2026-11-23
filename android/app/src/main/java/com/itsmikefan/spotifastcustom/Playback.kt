@@ -107,9 +107,17 @@ object Playback {
         }
     }
 
-    fun queue(uri: String) {
+    /** True while another device plays and this phone doesn't; the library's poll keeps it current. */
+    @Volatile var remoteActive = false
+
+    /** Queues on this phone, or on the device that is playing when that is another one. */
+    fun queue(uri: String, onError: (String) -> Unit) {
         scope.launch {
-            if (connect() != null) return@launch
+            if (remoteActive && !state.value.playing) {
+                runCatching { Spotify.queueRemote(uri) }.onFailure { onError("Could not queue it: ${it.message}") }
+                return@launch
+            }
+            connect()?.let { onError(it); return@launch }
             withContext(Dispatchers.IO) { Core.queue(uri) }
         }
     }

@@ -16,6 +16,8 @@ import coil.compose.AsyncImage
 import org.json.JSONObject
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Arrangement
@@ -170,6 +172,8 @@ private fun Library(signOut: () -> Unit) {
     var effects by remember { mutableStateOf(false) }
     var devices by remember { mutableStateOf(false) }
     var remote by remember { mutableStateOf<Remote?>(null) }
+    var query by remember { mutableStateOf("") }
+    var searching by remember { mutableStateOf<String?>(null) }
     val local by Playback.state.collectAsState()
     LaunchedEffect(Unit) {
         runCatching { Spotify.playlists() }.onSuccess { playlists = it }.onFailure { error = it.message }
@@ -179,24 +183,36 @@ private fun Library(signOut: () -> Unit) {
         while (true) {
             remote = if (Playback.state.value.playing) null
             else runCatching { Spotify.remote() }.getOrNull()?.takeIf { it.device != Playback.deviceName }
+            Playback.remoteActive = remote != null
             delay(3000)
         }
     }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-            if (open != null) TextButton(onClick = { open = null }) { Text("‹ Back") }
-            Text(open?.name ?: "Your library", fontSize = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            if (open != null || searching != null) TextButton(onClick = { if (searching != null) searching = null else open = null }) { Text("‹ Back") }
+            Text(searching?.let { "“$it”" } ?: open?.name ?: "Your library", fontSize = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
             TextButton(onClick = { devices = true }) { Text("Devices") }
             TextButton(onClick = { effects = true }) { Text("Effects") }
-            if (open == null) TextButton(onClick = signOut) { Text("Sign out") }
+            if (open == null && searching == null) TextButton(onClick = signOut) { Text("Sign out") }
         }
         HorizontalDivider()
         Column(Modifier.weight(1f)) {
             error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(16.dp)) }
+            val targets = playlists.orEmpty().filter { it.owned }
             when (val playlist = open) {
-                null -> playlists?.let { list ->
+                null -> searching?.let { q ->
+                    BackHandler { searching = null }
+                    SearchSongs(q, targets) { error = it }
+                } ?: playlists?.let { list ->
+                    SearchField(query, "Search playlists or songs") { query = it }
                     LazyColumn {
-                        items(list) { p ->
+                        if (query.isNotBlank()) item {
+                            Text(
+                                "Search Spotify for songs: “${query.trim()}”", color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.fillMaxWidth().clickable { searching = query.trim() }.padding(16.dp, 12.dp),
+                            )
+                        }
+                        items(list.filter { query.isBlank() || it.name.contains(query.trim(), ignoreCase = true) }) { p ->
                             Row(Modifier.fillMaxWidth().clickable { open = p }.padding(16.dp, 8.dp), verticalAlignment = Alignment.CenterVertically) {
                                 Cover(p.cover)
                                 Text(p.name, Modifier.weight(1f).padding(start = 12.dp), maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -227,18 +243,15 @@ private fun Loading() = Column(Modifier.fillMaxSize(), Arrangement.Center, Align
     CircularProgressIndicator()
 }
 
-@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boolean) -> Unit, onError: (String) -> Unit) {
     var tracks by remember(playlist.id) { mutableStateOf<List<Track>?>(null) }
     var complete by remember(playlist.id) { mutableStateOf(false) }
     var reload by remember { mutableIntStateOf(0) }
-    var menuFor by remember { mutableStateOf<Track?>(null) }
-    var adding by remember { mutableStateOf<Track?>(null) }
     var finding by remember { mutableStateOf(false) }
     var unavailableOnly by remember(playlist.id) { mutableStateOf(false) }
+    var filter by remember(playlist.id) { mutableStateOf("") }
     var public by remember(playlist.id) { mutableStateOf(playlist.public) }
-    val playing by Playback.state.collectAsState()
     val scope = rememberCoroutineScope()
     LaunchedEffect(playlist.id, reload) {
         complete = false
@@ -246,76 +259,125 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
     }
     val list = tracks ?: return Loading()
     val unavailable = list.count { !it.playable }
+    val shown = list.filter { (!unavailableOnly || !it.playable) && matches(it, filter) }
     Column {
+        SearchField(filter, "Filter this playlist") { filter = it }
         if (playlist.owned || unavailable > 0) {
-            Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    if (!playlist.owned) "" else if (public == false) "Private" else "Public", color = Color.Gray, fontSize = 13.sp,
-                    modifier = Modifier.padding(start = 8.dp).weight(1f),
-                )
+            // Scrolls sideways rather than squeezing the label into a column of letters.
+            Row(
+                Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (playlist.owned) {
+                    Text(if (public == false) "Private" else "Public", color = Color.Gray, fontSize = 13.sp, maxLines = 1, modifier = Modifier.padding(horizontal = 8.dp))
+                    TextButton(onClick = {
+                        val was = public
+                        val now = was == false
+                        public = now
+                        onPublic(now)
+                        scope.launch {
+                            runCatching { Spotify.setPublic(playlist, now) }
+                                .onSuccess { Spotify.publicNow(playlist)?.takeIf { it != now }?.let {
+                                    onError("Spotify took the change but still lists this playlist as ${if (it) "public" else "private"}.")
+                                } }
+                                .onFailure {
+                                    public = was
+                                    was?.let(onPublic)
+                                    onError("Could not make it ${if (now) "public" else "private"}: ${it.message}")
+                                }
+                        }
+                    }) { Text(if (public == false) "Make public" else "Make private") }
+                }
                 // As on the desktop: shows only the songs Spotify says this account can't play.
                 if (unavailable > 0 || unavailableOnly) TextButton(onClick = { unavailableOnly = !unavailableOnly }) {
                     Text(if (unavailableOnly) "Show all" else "Unavailable ($unavailable)")
                 }
-                if (playlist.owned) {
-                TextButton(onClick = {
-                    val was = public
-                    val now = was == false
-                    public = now
-                    onPublic(now)
-                    scope.launch {
-                        runCatching { Spotify.setPublic(playlist, now) }.onFailure {
-                            public = was
-                            was?.let(onPublic)
-                            onError("Could not make it ${if (now) "public" else "private"}: ${it.message}")
-                        }
-                    }
-                }) { Text(if (public == false) "Make public" else "Make private") }
                 // It needs every song, so it waits for the rest to load.
-                TextButton(onClick = { finding = true }, enabled = complete) { Text("Find duplicates") }
-                }
+                if (playlist.owned) TextButton(onClick = { finding = true }, enabled = complete) { Text("Find duplicates") }
             }
             HorizontalDivider()
         }
         LazyColumn {
-            items(if (unavailableOnly) list.filter { !it.playable } else list) { t ->
-                val current = t.uri == playing.uri
-                Box {
-                    Row(
-                        Modifier.fillMaxWidth()
-                            .combinedClickable(
-                                onClick = { Playback.play(playlist.uri, t.uri, onError) },
-                                onLongClick = { menuFor = t },
-                            )
-                            .padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Box(Modifier.alpha(if (t.playable) 1f else 0.35f)) { Cover(t.cover) }
-                        Column(Modifier.weight(1f).padding(start = 12.dp)) {
-                            Text(
-                                t.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                                color = when { current -> MaterialTheme.colorScheme.primary; !t.playable -> Color.Gray; else -> Color.Unspecified },
-                            )
-                            Text(
-                                if (t.playable) t.artists else "Unavailable · ${t.artists}",
-                                maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp,
-                            )
-                        }
-                        // The same menu as a long press, easier to find.
-                        TextButton(onClick = { menuFor = t }) { Text("⋮", fontSize = 20.sp, color = Color.Gray) }
-                    }
-                    DropdownMenu(expanded = menuFor === t, onDismissRequest = { menuFor = null }) {
-                        DropdownMenuItem(text = { Text("Add to queue") }, onClick = { menuFor = null; Playback.queue(t.uri) })
-                        if (targets.isNotEmpty()) {
-                            DropdownMenuItem(text = { Text("Add to playlist…") }, onClick = { menuFor = null; adding = t })
-                        }
-                    }
-                }
-            }
+            items(shown) { t -> SongRow(t, targets, onError) { Playback.play(playlist.uri, t.uri, onError) } }
         }
     }
-    adding?.let { song -> AddToPlaylist(song, targets, onError) { adding = null } }
     if (finding) FindDuplicates(playlist, list, onError, close = { finding = false }) { reload++ }
+}
+
+private fun matches(t: Track, query: String) =
+    query.isBlank() || t.name.contains(query.trim(), ignoreCase = true) || t.artists.contains(query.trim(), ignoreCase = true)
+
+@Composable
+private fun SearchField(value: String, label: String, onChange: (String) -> Unit) {
+    OutlinedTextField(
+        value, onChange, label = { Text(label) }, singleLine = true,
+        trailingIcon = { if (value.isNotEmpty()) TextButton(onClick = { onChange("") }) { Text("✕") } },
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+    )
+}
+
+/** One song: tap plays it; the ⋮ button or a long press opens its menu. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SongRow(t: Track, targets: List<Playlist>, onError: (String) -> Unit, play: () -> Unit) {
+    val playing by Playback.state.collectAsState()
+    var menu by remember { mutableStateOf(false) }
+    var adding by remember { mutableStateOf(false) }
+    val current = t.uri == playing.uri
+    Box {
+        Row(
+            Modifier.fillMaxWidth()
+                .combinedClickable(onClick = play, onLongClick = { menu = true })
+                .padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(Modifier.alpha(if (t.playable) 1f else 0.35f)) { Cover(t.cover) }
+            Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                Text(
+                    t.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    color = when { current -> MaterialTheme.colorScheme.primary; !t.playable -> Color.Gray; else -> Color.Unspecified },
+                )
+                Text(
+                    if (t.playable) t.artists else "Unavailable · ${t.artists}",
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp,
+                )
+            }
+            // The same menu as a long press, easier to find.
+            TextButton(onClick = { menu = true }) { Text("⋮", fontSize = 20.sp, color = Color.Gray) }
+        }
+        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+            DropdownMenuItem(text = { Text("Add to queue") }, onClick = { menu = false; Playback.queue(t.uri, onError) })
+            if (targets.isNotEmpty()) DropdownMenuItem(text = { Text("Add to playlist…") }, onClick = { menu = false; adding = true })
+        }
+    }
+    if (adding) AddToPlaylist(t, targets, onError) { adding = false }
+}
+
+/** Songs from all of Spotify for [query], ten at a time. */
+@Composable
+private fun SearchSongs(query: String, targets: List<Playlist>, onError: (String) -> Unit) {
+    var results by remember(query) { mutableStateOf<List<Track>?>(null) }
+    var more by remember(query) { mutableStateOf(true) }
+    var loading by remember(query) { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    fun load() {
+        loading = true
+        scope.launch {
+            runCatching { Spotify.search(query, results?.size ?: 0) }
+                .onSuccess { page -> results = results.orEmpty() + page; more = page.isNotEmpty() }
+                .onFailure { onError(it.message ?: "Search failed"); results = results.orEmpty(); more = false }
+            loading = false
+        }
+    }
+    LaunchedEffect(query) { load() }
+    val list = results ?: return Loading()
+    LazyColumn {
+        if (list.isEmpty()) item { Text("No songs found.", color = Color.Gray, modifier = Modifier.padding(16.dp)) }
+        items(list) { t -> SongRow(t, targets, onError) { Playback.play(t.uri, null, onError) } }
+        if (more && list.isNotEmpty()) item {
+            TextButton(enabled = !loading, onClick = { load() }, modifier = Modifier.fillMaxWidth()) { Text(if (loading) "Loading…" else "More songs") }
+        }
+    }
 }
 
 /** Picks one of the listener's playlists and adds [song], warning first if it is already there. */

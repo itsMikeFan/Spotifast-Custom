@@ -65,6 +65,9 @@ static SPIRC: Mutex<Option<Spirc>> = Mutex::new(None);
 static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 /// The player behind [SPIRC], kept to preload the song a load starts with.
 static PLAYER: Mutex<Option<std::sync::Arc<Player>>> = Mutex::new(None);
+/// Songs queued from this app that librespot's queue list doesn't show yet:
+/// it only republishes that list on the next playback change.
+static QUEUED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 static EFFECTS: LazyLock<effects::SharedEffects> = LazyLock::new(effects::shared);
 
@@ -379,7 +382,8 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_load<'a>(
     guard((), || {
         // As on the desktop: librespot resolves the whole playlist before it
         // fetches the song, so fetch the song now and the load picks it up.
-        if let Some(uri) = track.as_deref().filter(|t| t.starts_with("spotify:track:"))
+        // A single song plays as its own context, with no track named.
+        if let Some(uri) = track.as_deref().or(Some(context.as_str())).filter(|t| t.starts_with("spotify:track:"))
             && let Ok(uri) = librespot_core::SpotifyUri::from_uri(uri)
             && let Some(player) = PLAYER.lock().unwrap_or_else(|p| p.into_inner()).as_ref()
         {
@@ -410,6 +414,7 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_queue<'a>(
         return;
     };
     guard((), || {
+        QUEUED.lock().unwrap_or_else(|p| p.into_inner()).push(uri.clone());
         spirc(|spirc| spirc.add_to_queue(librespot_core::SpotifyUri::from_uri(&uri)?))
     });
 }
@@ -470,6 +475,12 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_setEffects(
     }
 }
 
+/// [next] with the songs queued here in front, until librespot lists them or one starts.
+fn upcoming(queued: &mut Vec<String>, current: &str, next: Vec<String>) -> Vec<String> {
+    queued.retain(|uri| uri != current && !next.contains(uri));
+    queued.iter().cloned().chain(next).collect()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_state<'a>(
     env: JNIEnv<'a>,
@@ -492,7 +503,9 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_state<'a>(
                     .collect()
             })
             .unwrap_or_default();
-        state().json(rate(), &next)
+        let state = state();
+        let next = upcoming(&mut QUEUED.lock().unwrap_or_else(|p| p.into_inner()), &state.uri, next);
+        state.json(rate(), &next)
     });
     env.new_string(json)
         .map(|s| s.into_raw())
@@ -613,6 +626,17 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_activate<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn songs_queued_here_show_until_librespot_lists_them() {
+        let mut queued = vec!["q".to_string()];
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(upcoming(&mut queued, "now", s(&["a"])), s(&["q", "a"]));
+        assert_eq!(upcoming(&mut queued, "now", s(&["q", "a"])), s(&["q", "a"]));
+        assert!(queued.is_empty(), "listed by librespot, so no longer added");
+        let mut playing = vec!["q".to_string()];
+        assert_eq!(upcoming(&mut playing, "q", s(&["a"])), s(&["a"]));
+    }
 
     #[test]
     fn position_moves_only_while_playing_and_stops_at_the_end() {

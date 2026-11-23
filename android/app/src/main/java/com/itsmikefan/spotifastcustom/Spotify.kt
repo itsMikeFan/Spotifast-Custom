@@ -340,6 +340,25 @@ object Spotify {
         )
     }
 
+    /** Songs matching [query] across Spotify; Spotify now gives apps at most ten per request. */
+    suspend fun search(query: String, offset: Int): List<Track> {
+        val tracks = get("/search?type=track&limit=10&offset=$offset&market=from_token&q=${enc(query)}")
+            .optJSONObject("tracks")?.optJSONArray("items") ?: return emptyList()
+        return (0 until tracks.length()).mapNotNull { tracks.optJSONObject(it)?.let(::song) }
+    }
+
+    /** Adds [uri] to the queue of whichever device is active. */
+    suspend fun queueRemote(uri: String) {
+        call("POST", "/me/player/queue?uri=${enc(uri)}", null)
+    }
+
+    /** What Spotify now says about the playlist's visibility, read after a change. */
+    suspend fun publicNow(playlist: Playlist): Boolean? = runCatching {
+        // Spotify's reads lag a change a little, as the desktop found.
+        kotlinx.coroutines.delay(2000)
+        get("/playlists/${playlist.id}?fields=public").let { if (it.isNull("public")) null else it.optBoolean("public") }
+    }.getOrNull()
+
     /** What plays after the current song on whichever device is active. */
     suspend fun remoteQueue(): List<String> {
         val queue = get("/me/player/queue").optJSONArray("queue") ?: return emptyList()
