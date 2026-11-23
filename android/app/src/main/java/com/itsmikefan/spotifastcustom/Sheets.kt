@@ -352,6 +352,7 @@ private fun Devices(close: () -> Unit) {
         }
         items(listed.filter { it.name != Playback.deviceName }) { d ->
             DeviceRow(deviceIcon(d.type), d.name, d.type + if (d.active) " · playing" else "", d.active) { move(d.id, d.name) }
+            if (d.active && d.volume >= 0 && d.canSetVolume) DeviceVolume(d.volume)
         }
         items(extra) { row ->
             DeviceRow(
@@ -360,6 +361,21 @@ private fun Devices(close: () -> Unit) {
             ) { start(row) }
         }
         if (searching) item { Text("Looking for speakers on this network…", fontSize = 12.sp, color = p.dim, modifier = Modifier.padding(horizontal = 20.dp, vertical = 10.dp)) }
+    }
+}
+
+/** The playing device's volume, sent when you let go. */
+@Composable
+private fun DeviceVolume(start: Int) {
+    val p = LocalPalette.current
+    val scope = rememberCoroutineScope()
+    var level by remember { mutableStateOf(start.toFloat()) }
+    Row(Modifier.fillMaxWidth().padding(start = 60.dp, end = 20.dp), verticalAlignment = Alignment.CenterVertically) {
+        Icon(volumeIcon(Math.round(level)), null, Modifier.size(18.dp), tint = p.secondary)
+        Slider(
+            level, { level = it }, valueRange = 0f..100f, modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
+            onValueChangeFinished = { scope.launch { runCatching { Spotify.remoteVolume(Math.round(level)) } } },
+        )
     }
 }
 

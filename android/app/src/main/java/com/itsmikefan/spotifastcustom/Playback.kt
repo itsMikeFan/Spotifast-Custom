@@ -30,6 +30,8 @@ data class PlayState(
     val shuffle: Boolean = false,
     /** 0 off, 1 the playlist, 2 this song. */
     val repeat: Int = 0,
+    /** The app's volume, 0 to 100, as the core last reported it. */
+    val volume: Int = 100,
 )
 
 data class Effects(
@@ -78,12 +80,36 @@ object Playback {
             ),
             save = false,
         )
+        Core.setVolume(Settings.value.volume)
         scope.launch {
             while (true) {
-                state.value = withContext(Dispatchers.Default) { parse(Core.state()) }
+                val next = withContext(Dispatchers.Default) { parse(Core.state()) }
+                // Another Spotify app moved this phone's volume: keep the slider and the saved value with it.
+                if (next.connected && next.volume != Settings.value.volume && System.currentTimeMillis() - volumeSetAt > 1500) {
+                    Settings.update { it.copy(volume = next.volume) }
+                }
+                state.value = next
                 delay(500)
             }
         }
+    }
+
+    @Volatile private var volumeSetAt = 0L
+    /** The level Unmute goes back to. */
+    private var beforeMute = 100
+
+    /** Sets the app's volume at once; cheap enough to call on every slider move. */
+    fun setVolume(percent: Int) {
+        val v = percent.coerceIn(0, 100)
+        volumeSetAt = System.currentTimeMillis()
+        Core.setVolume(v)
+        if (v != Settings.value.volume) Settings.update { it.copy(volume = v) }
+        state.value = state.value.copy(volume = v)
+    }
+
+    fun toggleMute() {
+        val now = Settings.value.volume
+        if (now > 0) { beforeMute = now; setVolume(0) } else setVolume(beforeMute.takeIf { it > 0 } ?: 50)
     }
 
     fun setEffects(e: Effects, save: Boolean = true) {
@@ -145,7 +171,7 @@ object Playback {
             o.optBoolean("connected"), o.optBoolean("playing"), o.optString("uri"), o.optString("name"),
             o.optString("artists"), o.optInt("duration_ms"), o.optInt("position_ms"),
             o.optJSONArray("next")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList(),
-            o.optBoolean("shuffle"), o.optInt("repeat"),
+            o.optBoolean("shuffle"), o.optInt("repeat"), o.optInt("volume", 100),
         )
     }.getOrDefault(PlayState())
 }

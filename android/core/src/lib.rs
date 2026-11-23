@@ -15,6 +15,7 @@ mod limiter;
 #[path = "../../../src/resample.rs"]
 mod resample;
 mod vis;
+mod volume;
 // The desktop's Google Cast and Spotify Connect receiver activation.
 #[path = "../../../src/cast.rs"]
 mod cast;
@@ -41,7 +42,7 @@ use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
 use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
-use librespot_playback::mixer::{self, MixerConfig};
+use librespot_playback::mixer::Mixer;
 use librespot_playback::player::{Player, PlayerEvent};
 
 /// The client the playback grant belongs to (src/auth.rs on the desktop).
@@ -113,6 +114,7 @@ impl State {
             "duration_ms": self.duration_ms,
             "position_ms": self.position_now(rate),
             "shuffle": self.shuffle,
+            "volume": volume::volume_to_percent(volume::VOLUME.load(std::sync::atomic::Ordering::Relaxed)),
             // 0 off, 1 the playlist, 2 this song.
             "repeat": if self.repeat_track { 2 } else if self.repeat_context { 1 } else { 0 },
         })
@@ -141,6 +143,7 @@ struct AndroidSink {
     out: GlobalRef,
     effects: effects::Processor,
     limiter: limiter::Limiter,
+    gain: volume::Gain,
 }
 
 impl AndroidSink {
@@ -182,6 +185,8 @@ impl Sink for AndroidSink {
         let mut samples = self.effects.process(samples);
         self.limiter.process(&mut samples, 1.0);
         vis::push(&samples);
+        // After the tap, so the bars don't follow the volume.
+        self.gain.process(&mut samples);
         let samples = converter.f64_to_f32(&samples);
         let mut env = self
             .vm
@@ -237,9 +242,7 @@ fn connect(
             ..SessionConfig::default()
         };
         let session = Session::new(session_config, Some(cache));
-        let mixer = mixer::find(Some("softvol")).ok_or_else(|| anyhow::anyhow!("no mixer"))?(
-            MixerConfig::default(),
-        )?;
+        let mixer: std::sync::Arc<dyn Mixer> = std::sync::Arc::new(volume::AppMixer);
         let player_config = PlayerConfig {
             bitrate: Bitrate::Bitrate320,
             position_update_interval: Some(std::time::Duration::from_secs(1)),
@@ -255,6 +258,7 @@ fn connect(
                     out,
                     effects: effects::Processor::new(EFFECTS.clone()),
                     limiter: limiter::Limiter::new(f64::from(SAMPLE_RATE)),
+                    gain: volume::Gain::new(f64::from(SAMPLE_RATE)),
                 })
             },
         );
@@ -263,10 +267,10 @@ fn connect(
         let config = ConnectConfig {
             name: device_name,
             device_type: DeviceType::Smartphone,
-            // librespot starts at half volume, which is far quieter on its
-            // log curve; the phone's own volume keys set loudness instead.
-            initial_volume: u16::MAX,
-            disable_volume: true,
+            // The app's slider, which Kotlin sets before connecting. Spotify
+            // Connect sees it, so the PC app shows and moves it too.
+            initial_volume: volume::VOLUME.load(std::sync::atomic::Ordering::Relaxed),
+            disable_volume: false,
             ..ConnectConfig::default()
         };
         let (spirc, task) = Spirc::new(config, session.clone(), credentials, player, mixer).await?;
@@ -475,6 +479,23 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_command(
                 .and_then(|()| spirc.repeat_track(value == 2)),
             _ => Ok(()),
         })
+    });
+}
+
+/// The app's volume, 0 to 100. Through Spirc when connected, so Spotify
+/// Connect hears of it; straight to the mixer's value otherwise.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_setVolume(
+    _env: JNIEnv,
+    _this: JObject,
+    percent: jint,
+) {
+    guard((), || {
+        let value = volume::percent_to_volume(percent);
+        volume::VOLUME.store(value, std::sync::atomic::Ordering::Relaxed);
+        if let Some(spirc) = SPIRC.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+            let _ = spirc.set_volume(value);
+        }
     });
 }
 

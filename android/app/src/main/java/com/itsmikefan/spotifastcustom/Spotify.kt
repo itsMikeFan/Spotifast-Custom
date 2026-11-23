@@ -34,7 +34,7 @@ data class Track(
     val playable: Boolean = true,
     val album: String = "", val albumUri: String = "", val bigCover: String? = null,
 )
-data class Device(val id: String, val name: String, val type: String, val active: Boolean)
+data class Device(val id: String, val name: String, val type: String, val active: Boolean, val volume: Int = -1, val canSetVolume: Boolean = true)
 /** What plays on another Spotify Connect device. */
 data class Remote(
     val device: String, val playing: Boolean, val name: String, val artists: String, val cover: String?,
@@ -360,7 +360,10 @@ object Spotify {
     suspend fun devices(): List<Device> {
         val list = get("/me/player/devices").optJSONArray("devices") ?: return emptyList()
         return (0 until list.length()).map { list.getJSONObject(it) }.filter { !it.isNull("id") }.map {
-            Device(it.getString("id"), it.optString("name"), it.optString("type"), it.optBoolean("is_active"))
+            Device(
+                it.getString("id"), it.optString("name"), it.optString("type"), it.optBoolean("is_active"),
+                if (it.isNull("volume_percent")) -1 else it.optInt("volume_percent", -1), it.optBoolean("supports_volume", true),
+            )
         }
     }
 

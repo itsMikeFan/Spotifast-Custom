@@ -92,8 +92,26 @@ class PlaybackService : Service() {
         MediaButtonReceiver.handleIntent(session, intent)
         if (watching == null) {
             watching = Playback.scope.launch { Playback.state.collect(::show) }
+            Playback.scope.launch { Settings.state.collect(::volumeKeys) }
         }
         return START_NOT_STICKY
+    }
+
+    /** With "Volume keys control the app" on, the phone's volume buttons move the app's slider instead. */
+    private val keys = object : androidx.media.VolumeProviderCompat(androidx.media.VolumeProviderCompat.VOLUME_CONTROL_ABSOLUTE, 100, Settings.value.volume) {
+        override fun onSetVolumeTo(volume: Int) = Playback.setVolume(volume)
+        override fun onAdjustVolume(direction: Int) {
+            if (direction != 0) Playback.setVolume(Settings.value.volume + 5 * direction)
+        }
+    }
+    private var remoteKeys: Boolean? = null
+
+    private fun volumeKeys(s: AppSettings) {
+        if (s.volumeKeysApp != remoteKeys) {
+            remoteKeys = s.volumeKeysApp
+            if (s.volumeKeysApp) session.setPlaybackToRemote(keys) else session.setPlaybackToLocal(AudioManager.STREAM_MUSIC)
+        }
+        if (keys.currentVolume != s.volume) keys.currentVolume = s.volume
     }
 
     private fun show(state: PlayState) {

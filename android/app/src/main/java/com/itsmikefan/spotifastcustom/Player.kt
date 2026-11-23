@@ -226,9 +226,50 @@ fun FullPlayer(remote: Remote?, onRemote: (Remote) -> Unit, nav: Nav, close: () 
     }
 }
 
-/** Filled in by the volume build. */
+/** The desktop's thresholds for the speaker icon. */
+fun volumeIcon(percent: Int) = when {
+    percent <= 0 -> Icons.VolumeX
+    percent <= 33 -> Icons.Volume
+    percent <= 66 -> Icons.Volume1
+    else -> Icons.Volume2
+}
+
+/**
+ * Speaker icon (tap mutes), slider and percentage. Here it is the app's own
+ * volume, applied as you drag; for another device it goes through the Web
+ * API when you let go, as on the desktop.
+ */
 @Composable
-fun VolumeRow(remote: Remote?, onRemote: (Remote) -> Unit) {}
+fun VolumeRow(remote: Remote?, onRemote: (Remote) -> Unit) {
+    val p = LocalPalette.current
+    val s by Settings.state.collectAsState()
+    val scope = rememberCoroutineScope()
+    var dragging by remember { mutableStateOf<Float?>(null) }
+    val adjustable = remote?.canSetVolume ?: true
+    val level = dragging?.let { Math.round(it) } ?: if (remote != null) remote.volume.coerceAtLeast(0) else s.volume
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        IconBtn(volumeIcon(level), if (level == 0) "Unmute" else "Mute", 22.dp, enabled = adjustable && remote == null) { Playback.toggleMute() }
+        Slider(
+            value = level.toFloat(), valueRange = 0f..100f, enabled = adjustable,
+            onValueChange = { v ->
+                dragging = v
+                if (remote == null) Playback.setVolume(Math.round(v))
+            },
+            onValueChangeFinished = {
+                val v = dragging?.let { Math.round(it) }
+                dragging = null
+                if (remote != null && v != null) {
+                    onRemote(remote.copy(volume = v))
+                    scope.launch { runCatching { Spotify.remoteVolume(v) } }
+                }
+            },
+            colors = SliderDefaults.colors(thumbColor = p.text, activeTrackColor = p.text, inactiveTrackColor = p.surfaceActive),
+            modifier = Modifier.weight(1f),
+        )
+        Text("$level%", fontSize = 12.sp, color = p.secondary, modifier = Modifier.padding(start = 8.dp))
+    }
+    if (!adjustable) Text("This device's volume can't be changed from Spotifast", fontSize = 12.sp, color = p.dim)
+}
 
 @OptIn(ExperimentalFoundationApi::class)
 private fun Modifier.combinedClickableLong(onLong: () -> Unit) = this.combinedClickable(onClick = {}, onLongClick = onLong)

@@ -139,7 +139,25 @@ private fun PlaybackSection(s: AppSettings, query: String) {}
 
 @Composable
 private fun SoundSection(s: AppSettings, openEffects: () -> Unit) {
+    val p = LocalPalette.current
     SectionCard("Sound") {
+        SettingRow("Volume", "The app's own volume. The phone's volume still applies on top.") {}
+        androidx.compose.foundation.layout.Row(Modifier.padding(start = 8.dp, end = 16.dp, bottom = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconBtn(com.itsmikefan.spotifastcustom.volumeIcon(s.volume), if (s.volume == 0) "Unmute" else "Mute") { Playback.toggleMute() }
+            androidx.compose.material3.Slider(
+                s.volume.toFloat(), { Playback.setVolume(Math.round(it)) }, valueRange = 0f..100f, modifier = Modifier.weight(1f),
+                colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = p.accent, activeTrackColor = p.accent, inactiveTrackColor = p.surfaceActive),
+            )
+            Text("${s.volume}%", fontSize = 13.sp, color = p.secondary, modifier = Modifier.padding(start = 8.dp))
+        }
+        RowDivider()
+        SwitchRow(
+            "Volume keys control the app",
+            if (s.volumeKeysApp) "The phone's volume buttons move this slider. Keep the phone's media volume high."
+            else "The phone's volume buttons change the phone's media volume.",
+            s.volumeKeysApp,
+        ) { v -> Settings.update { it.copy(volumeKeysApp = v) } }
+        RowDivider()
         SettingRow("Effects", "Rate, bass, reverb and room size", onClick = openEffects) {
             Icon(Icons.AudioLines, null, Modifier.size(20.dp), tint = LocalPalette.current.secondary)
         }

@@ -31,6 +31,9 @@ object Core {
     /** The visualizer's bar heights, 0 to 1. */
     external fun bands(): FloatArray
 
+    /** The app's volume, 0 to 100, applied after the visualizer; Spotify Connect hears of it too. */
+    external fun setVolume(percent: Int)
+
     external fun setEffects(on: Boolean, ratePercent: Int, bassDb: Float, reverbMix: Float, reverbRoom: Float)
 
     /** JSON: next (upcoming URIs), connected, playing, uri, name, artists, duration_ms, position_ms. */
