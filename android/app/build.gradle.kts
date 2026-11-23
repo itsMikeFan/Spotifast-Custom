@@ -51,4 +51,6 @@ dependencies {
     // Covers.
     implementation("io.coil-kt:coil-compose:2.7.0")
     testImplementation("junit:junit:4.13.2")
+    // Android's own org.json is a stub in unit tests.
+    testImplementation("org.json:json:20240303")
 }

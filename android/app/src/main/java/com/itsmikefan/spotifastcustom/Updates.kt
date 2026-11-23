@@ -50,7 +50,7 @@ object Updates {
     fun buildNumber(title: String): Long? = Regex("""build (\d+)""").find(title)?.groupValues?.get(1)?.toLongOrNull()
 
     @Suppress("DEPRECATION")
-    private fun installed(context: Context): Long {
+    fun installed(context: Context): Long {
         val info = context.packageManager.getPackageInfo(context.packageName, 0)
         return if (android.os.Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
     }

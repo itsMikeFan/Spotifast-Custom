@@ -40,6 +40,7 @@ data class Effects(
 class App : Application() {
     override fun onCreate() {
         super.onCreate()
+        Settings.init(this)
         Spotify.init(this)
         Playback.init(this)
     }

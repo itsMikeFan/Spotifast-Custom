@@ -64,6 +64,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.material3.Icon
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
+import com.itsmikefan.spotifastcustom.ui.Icons
+import com.itsmikefan.spotifastcustom.ui.IconBtn
+import com.itsmikefan.spotifastcustom.ui.LocalPalette
+import com.itsmikefan.spotifastcustom.ui.SettingsScreen
+import com.itsmikefan.spotifastcustom.ui.SpotifastTheme
+import com.itsmikefan.spotifastcustom.ui.chosenPalette
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,8 +85,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 0)
         setContent {
-            MaterialTheme(colorScheme = darkColorScheme(primary = Color(0xFF1ED760), onPrimary = Color.Black)) {
-                Surface(Modifier.fillMaxSize()) {
+            val s by Settings.state.collectAsState()
+            val palette = chosenPalette(this, s.theme, s.lightTheme, s.darkTheme)
+            SpotifastTheme(palette) {
+                Surface(Modifier.fillMaxSize(), color = palette.window, contentColor = palette.text) {
                     Column(Modifier.safeDrawingPadding()) { Root() }
                 }
             }
@@ -86,19 +99,52 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun Root() {
     var signedIn by remember { mutableStateOf(Spotify.signedIn && Playback.hasPlaybackSignIn) }
-    if (!signedIn) SignIn { signedIn = true } else Library { Spotify.signOut(); Playback.forgetPlaybackSignIn(); signedIn = false }
-    UpdatePrompt()
+    var offered by remember { mutableStateOf<Updates.Update?>(null) }
+    if (!signedIn) SignIn { signedIn = true } else Main(offer = { offered = it }) { Spotify.signOut(); Playback.forgetPlaybackSignIn(); signedIn = false }
+    UpdatePrompt(offered) { offered = null }
+}
+
+private enum class Tab(val label: String) { Library("Library"), Search("Search"), Settings("Settings") }
+
+/** Library, Search and Settings over the player, as the desktop keeps its player bar under every page. */
+@Composable
+private fun Main(offer: (Updates.Update) -> Unit, signOut: () -> Unit) {
+    var tab by rememberSaveable { mutableStateOf(Tab.Library) }
+    var effects by remember { mutableStateOf(false) }
+    val p = LocalPalette.current
+    Column(Modifier.fillMaxSize()) {
+        Box(Modifier.weight(1f)) {
+            when (tab) {
+                Tab.Library -> Library(searchTab = false)
+                Tab.Search -> Library(searchTab = true)
+                Tab.Settings -> SettingsScreen(openEffects = { effects = true }, signOut = signOut, offerUpdate = offer)
+            }
+        }
+        NavigationBar(containerColor = p.panel, tonalElevation = 0.dp) {
+            for (t in Tab.entries) NavigationBarItem(
+                selected = tab == t, onClick = { tab = t },
+                icon = { Icon(when (t) { Tab.Library -> Icons.LibraryBig; Tab.Search -> Icons.Search; Tab.Settings -> Icons.Settings }, null, Modifier.size(22.dp)) },
+                label = { Text(t.label) },
+                colors = NavigationBarItemDefaults.colors(
+                    selectedIconColor = p.text, selectedTextColor = p.text, indicatorColor = p.surfaceActive,
+                    unselectedIconColor = p.dim, unselectedTextColor = p.dim,
+                ),
+            )
+        }
+    }
+    if (effects) EffectsDialog { effects = false }
 }
 
 /** Offers a newer build from GitHub once per launch; installing it keeps the sign-in and settings. */
 @Composable
-private fun UpdatePrompt() {
+private fun UpdatePrompt(offered: Updates.Update?, done: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val scope = rememberCoroutineScope()
     var update by remember { mutableStateOf<Updates.Update?>(null) }
     var busy by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    LaunchedEffect(Unit) { update = Updates.check(context) }
+    LaunchedEffect(Unit) { if (Settings.value.checkForUpdates) update = Updates.check(context) }
+    LaunchedEffect(offered) { if (offered != null) { update = offered; done() } }
     val found = update ?: return
     AlertDialog(
         onDismissRequest = { if (!busy) update = null },
@@ -165,7 +211,7 @@ private fun SignIn(done: () -> Unit) {
 }
 
 @Composable
-private fun Library(signOut: () -> Unit) {
+private fun Library(searchTab: Boolean) {
     var playlists by remember { mutableStateOf<List<Playlist>?>(null) }
     var open by remember { mutableStateOf<Playlist?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -190,10 +236,9 @@ private fun Library(signOut: () -> Unit) {
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
             if (open != null || searching != null) TextButton(onClick = { if (searching != null) searching = null else open = null }) { Text("‹ Back") }
-            Text(searching?.let { "“$it”" } ?: open?.name ?: "Your library", fontSize = 20.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-            TextButton(onClick = { devices = true }) { Text("Devices") }
-            TextButton(onClick = { effects = true }) { Text("Effects") }
-            if (open == null && searching == null) TextButton(onClick = signOut) { Text("Sign out") }
+            Text(searching?.let { "“$it”" } ?: open?.name ?: if (searchTab) "Search" else "Your library", style = MaterialTheme.typography.titleLarge, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+            IconBtn(Icons.Speaker, "Devices") { devices = true }
+            IconBtn(Icons.AudioLines, "Effects", on = Playback.effects.collectAsState().value.on) { effects = true }
         }
         HorizontalDivider()
         Column(Modifier.weight(1f)) {
