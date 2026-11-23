@@ -117,6 +117,12 @@ fun SettingsScreen(openEffects: () -> Unit, signOut: () -> Unit, offerUpdate: (U
             }
             if (shows("About", "Version")) SectionCard("About") {
                 SettingRow("Spotifast Custom", "Build ${Updates.installed(context)} · this phone shows as “${Playback.deviceName}”")
+                // For bug reports: the player's own account of what went wrong.
+                SettingRow("Copy playback log", "The player's recent messages, to paste when something doesn't play", onClick = {
+                    val clipboard = context.getSystemService(android.content.ClipboardManager::class.java)
+                    clipboard.setPrimaryClip(android.content.ClipData.newPlainText("Spotifast playback log", com.itsmikefan.spotifastcustom.Core.log().ifEmpty { "(empty)" }))
+                    android.widget.Toast.makeText(context, "Playback log copied", android.widget.Toast.LENGTH_SHORT).show()
+                })
             }
             Spacer(Modifier.height(24.dp))
         }

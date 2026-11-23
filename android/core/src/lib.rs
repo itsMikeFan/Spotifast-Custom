@@ -343,12 +343,24 @@ struct Logger {
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        metadata.level() <= log::Level::Info
+        // Debug too, for the copyable log; logcat keeps its own Info filter.
+        metadata.level() <= log::Level::Debug
     }
 
     fn log(&self, record: &log::Record) {
         #[cfg(target_os = "android")]
         log::Log::log(&self.android, record);
+        if record.target().starts_with("librespot") || record.target().starts_with("spotifast") {
+            let mut lines = LOG.lock().unwrap_or_else(|p| p.into_inner());
+            if lines.len() >= 1500 {
+                lines.pop_front();
+            }
+            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() % 86_400);
+            lines.push_back(format!(
+                "{:02}:{:02}:{:02} {} {}: {}",
+                secs / 3600, secs / 60 % 60, secs % 60, record.level(), record.target(), record.args()
+            ));
+        }
         // Only a refused audio key stops a song for good; librespot's other
         // warnings (dropped websockets, missing context info) it recovers from.
         if record.level() <= log::Level::Warn && record.target().ends_with("audio_key") {
@@ -362,6 +374,16 @@ impl log::Log for Logger {
     fn flush(&self) {}
 }
 
+/// The latest log lines, for Settings' "Copy playback log": phones don't let
+/// a listener read logcat.
+static LOG: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_log<'a>(env: JNIEnv<'a>, _this: JObject<'a>) -> jstring {
+    let text = LOG.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect::<Vec<_>>().join("\n");
+    env.new_string(text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 fn init_logging() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
@@ -372,7 +394,7 @@ fn init_logging() {
             ),
         };
         if log::set_logger(Box::leak(Box::new(logger))).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
+            log::set_max_level(log::LevelFilter::Debug);
         }
     });
 }

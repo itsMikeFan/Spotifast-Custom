@@ -35,6 +35,9 @@ object Core {
     /** The visualizer's 75 bar heights then their 75 peak caps, 0 to 1. */
     external fun bands(): FloatArray
 
+    /** The player's latest log lines (UTC times), for reporting a problem. */
+    external fun log(): String
+
     /** The waveform: [points] values from -1 to 1. */
     external fun scope(points: Int): FloatArray
 
