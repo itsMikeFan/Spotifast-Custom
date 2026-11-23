@@ -32,6 +32,8 @@ data class PlayState(
     val repeat: Int = 0,
     /** The app's volume, 0 to 100, as the core last reported it. */
     val volume: Int = 100,
+    /** Why the last song didn't start, from the player; empty once one plays. */
+    val error: String = "",
 )
 
 data class Effects(
@@ -196,7 +198,7 @@ object Playback {
             o.optBoolean("connected"), o.optBoolean("playing"), o.optString("uri"), o.optString("name"),
             o.optString("artists"), o.optInt("duration_ms"), o.optInt("position_ms"),
             o.optJSONArray("next")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList(),
-            o.optBoolean("shuffle"), o.optInt("repeat"), o.optInt("volume", 100),
+            o.optBoolean("shuffle"), o.optInt("repeat"), o.optInt("volume", 100), o.optString("error"),
         )
     }.getOrDefault(PlayState())
 }

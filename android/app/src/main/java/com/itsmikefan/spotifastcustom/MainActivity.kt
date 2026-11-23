@@ -108,6 +108,8 @@ private fun Main(offer: (Updates.Update) -> Unit, signOut: () -> Unit) {
             kotlinx.coroutines.delay(3000)
         }
     }
+    // A song that never starts says why, instead of sitting at 0:00.
+    LaunchedEffect(local.error) { if (local.error.isNotEmpty() && !local.playing) error = "Playback: ${local.error}" }
     val owned = playlists.orEmpty().filter { it.owned }
     val nav = Nav(
         openPlaylist = { open = it; if (tab == Tab.Settings) tab = Tab.Library },

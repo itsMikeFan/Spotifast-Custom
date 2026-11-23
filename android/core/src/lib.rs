@@ -91,6 +91,8 @@ struct State {
     shuffle: bool,
     repeat_context: bool,
     repeat_track: bool,
+    /// Why playback stopped short, from the player or librespot's log; cleared once a song plays.
+    error: String,
 }
 
 impl State {
@@ -119,6 +121,7 @@ impl State {
             "volume": volume::volume_to_percent(volume::VOLUME.load(std::sync::atomic::Ordering::Relaxed)),
             // 0 off, 1 the playlist, 2 this song.
             "repeat": if self.repeat_track { 2 } else if self.repeat_context { 1 } else { 0 },
+            "error": self.error,
         })
         .to_string()
     }
@@ -283,11 +286,16 @@ async fn follow(mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>) {
                     UniqueFields::Episode { show_name, .. } => show_name.clone(),
                 };
             }
+            PlayerEvent::Unavailable { .. } => state.error = "Spotify says this song can't be played on this account.".into(),
+            PlayerEvent::AudioKeyUnavailable { .. } => state.error = "Spotify refused the key to decrypt this song.".into(),
             PlayerEvent::Playing { position_ms, .. }
             | PlayerEvent::PositionChanged { position_ms, .. }
             | PlayerEvent::PositionCorrection { position_ms, .. }
             | PlayerEvent::Seeked { position_ms, .. } => {
                 let playing = state.playing || matches!(event, PlayerEvent::Playing { .. });
+                if playing {
+                    state.error.clear();
+                }
                 state.at(position_ms, playing);
             }
             PlayerEvent::Paused { position_ms, .. } => {
@@ -326,6 +334,47 @@ fn string(env: &mut JNIEnv, value: &JString) -> Option<String> {
     env.get_string(value).ok().map(Into::into)
 }
 
+/// Logs to logcat and keeps librespot's latest warning or error for the app to
+/// show: a song that never starts otherwise fails silently on the phone.
+struct Logger {
+    #[cfg(target_os = "android")]
+    android: android_logger::AndroidLogger,
+}
+
+impl log::Log for Logger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Info
+    }
+
+    fn log(&self, record: &log::Record) {
+        #[cfg(target_os = "android")]
+        log::Log::log(&self.android, record);
+        if record.level() <= log::Level::Warn && record.target().starts_with("librespot") {
+            // try_lock: the state's own holders may log, and a missed message beats a deadlock.
+            if let Ok(mut state) = STATE.try_lock() {
+                state.error = record.args().to_string();
+            }
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+fn init_logging() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let logger = Logger {
+            #[cfg(target_os = "android")]
+            android: android_logger::AndroidLogger::new(
+                android_logger::Config::default().with_max_level(log::LevelFilter::Info).with_tag("spotifast"),
+            ),
+        };
+        if log::set_logger(Box::leak(Box::new(logger))).is_ok() {
+            log::set_max_level(log::LevelFilter::Info);
+        }
+    });
+}
+
 /// A panic must not unwind into the JVM.
 fn guard<T>(fallback: T, body: impl FnOnce() -> T) -> T {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
@@ -343,12 +392,7 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_connect<'a>(
     token: JString<'a>,
     device_name: JString<'a>,
 ) -> jstring {
-    #[cfg(target_os = "android")]
-    android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info)
-            .with_tag("spotifast"),
-    );
+    init_logging();
     let error = guard(Some("native panic".to_string()), || {
         let vm = env.get_java_vm().ok()?;
         let out = env.new_global_ref(&out).ok()?;
