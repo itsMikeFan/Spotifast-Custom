@@ -84,6 +84,36 @@ class MainActivity : ComponentActivity() {
 private fun Root() {
     var signedIn by remember { mutableStateOf(Spotify.signedIn && Playback.hasPlaybackSignIn) }
     if (!signedIn) SignIn { signedIn = true } else Library { Spotify.signOut(); Playback.forgetPlaybackSignIn(); signedIn = false }
+    UpdatePrompt()
+}
+
+/** Offers a newer build from GitHub once per launch; installing it keeps the sign-in and settings. */
+@Composable
+private fun UpdatePrompt() {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    var update by remember { mutableStateOf<Updates.Update?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var error by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(Unit) { update = Updates.check(context) }
+    val found = update ?: return
+    AlertDialog(
+        onDismissRequest = { if (!busy) update = null },
+        title = { Text("Update available") },
+        text = { Text(error ?: if (busy) "Downloading build ${found.build}…" else "Build ${found.build} is out. Install it now? Your sign-in and settings stay.") },
+        confirmButton = {
+            TextButton(enabled = !busy, onClick = {
+                busy = true; error = null
+                scope.launch {
+                    runCatching { Updates.install(context, found) }
+                        .onSuccess { update = null }
+                        .onFailure { error = "Could not download it: ${it.message}" }
+                    busy = false
+                }
+            }) { Text(if (error != null) "Try again" else "Update") }
+        },
+        dismissButton = { TextButton(enabled = !busy, onClick = { update = null }) { Text("Later") } },
+    )
 }
 
 @Composable
