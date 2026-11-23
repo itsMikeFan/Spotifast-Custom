@@ -414,6 +414,74 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_load<'a>(
     });
 }
 
+/// The playlist's song URIs, kept for the pages after the first.
+static PLAYLIST: Mutex<Option<(String, Vec<librespot_core::SpotifyUri>)>> = Mutex::new(None);
+
+/// A page of a playlist's songs read through the playback session, shaped like
+/// the Web API's playlist items. Spotify's Web API only lists the songs of
+/// playlists the listener owns, so other people's playlists come from here.
+async fn playlist_page(session: Session, uri: String, offset: usize, count: usize) -> anyhow::Result<serde_json::Value> {
+    use librespot_metadata::{Metadata, Playlist, Track};
+    let cached = PLAYLIST.lock().unwrap_or_else(|p| p.into_inner()).clone().filter(|(u, _)| *u == uri);
+    let tracks = match cached {
+        Some((_, tracks)) => tracks,
+        None => {
+            let id = librespot_core::SpotifyUri::from_uri(&uri)?;
+            let tracks: Vec<_> = Playlist::get(&session, &id).await?.tracks().cloned().collect();
+            *PLAYLIST.lock().unwrap_or_else(|p| p.into_inner()) = Some((uri, tracks.clone()));
+            tracks
+        }
+    };
+    let mut set = tokio::task::JoinSet::new();
+    for (i, id) in tracks.iter().enumerate().skip(offset).take(count) {
+        let (session, id) = (session.clone(), id.clone());
+        set.spawn(async move { (i, Track::get(&session, &id).await.ok()) });
+    }
+    let mut found = Vec::new();
+    while let Some(joined) = set.join_next().await {
+        // A song Spotify won't describe is left out rather than ending the page.
+        let Ok((i, Some(track))) = joined else { continue };
+        let mut covers: Vec<_> = track.album.covers.iter().collect();
+        covers.sort_by_key(|c| std::cmp::Reverse(c.width));
+        let images: Vec<_> = covers
+            .iter()
+            .map(|c| serde_json::json!({ "url": format!("https://i.scdn.co/image/{}", c.id.to_base16()) }))
+            .collect();
+        let artists: Vec<_> = track.artists.iter().map(|a| serde_json::json!({ "name": a.name })).collect();
+        found.push((i, serde_json::json!({ "item": {
+            "uri": track.id.to_uri(),
+            "name": track.name,
+            "duration_ms": track.duration,
+            "artists": artists,
+            "album": { "name": track.album.name, "uri": track.album.id.to_uri(), "images": images },
+        }})));
+    }
+    found.sort_by_key(|(i, _)| *i);
+    let items: Vec<_> = found.into_iter().map(|(_, item)| item).collect();
+    Ok(serde_json::json!({ "total": tracks.len(), "items": items }))
+}
+
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_playlistPage<'a>(
+    mut env: JNIEnv<'a>,
+    _this: JObject<'a>,
+    uri: JString<'a>,
+    offset: jint,
+    count: jint,
+) -> jstring {
+    let uri = string(&mut env, &uri).unwrap_or_default();
+    let json = guard(String::from(r#"{"error":"crashed"}"#), || {
+        let Some(session) = SESSION.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+            return r#"{"error":"not connected"}"#.to_string();
+        };
+        match RUNTIME.block_on(playlist_page(session, uri, offset.max(0) as usize, count.max(0) as usize)) {
+            Ok(page) => page.to_string(),
+            Err(error) => serde_json::json!({ "error": error.to_string() }).to_string(),
+        }
+    });
+    env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+}
+
 /// Adds a song to Spotify's queue: it plays after the current song.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_queue<'a>(

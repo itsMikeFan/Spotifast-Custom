@@ -274,6 +274,11 @@ object Spotify {
      * playlist shows its top while the remainder loads.
      */
     suspend fun tracks(playlist: Playlist, onPage: (List<Track>) -> Unit = {}): List<Track> = coroutineScope {
+        // Spotify's Web API only lists the songs of playlists the listener owns or
+        // collaborates on (403 otherwise), so others come through the playback session.
+        if (!playlist.owned && playlist.uri.startsWith("spotify:playlist:")) {
+            return@coroutineScope sessionTracks(playlist, onPage)
+        }
         val first = get(playlist.tracksPath)
         val result = songs(first).toMutableList()
         onPage(result.toList())
@@ -285,6 +290,20 @@ object Spotify {
             onPage(result.toList())
         }
         result
+    }
+
+    private suspend fun sessionTracks(playlist: Playlist, onPage: (List<Track>) -> Unit): List<Track> {
+        Playback.connect()?.let { throw IOException(it) }
+        val result = mutableListOf<Track>()
+        var offset = 0
+        while (true) {
+            val page = JSONObject(withContext(Dispatchers.IO) { Core.playlistPage(playlist.uri, offset, PAGE) })
+            page.optString("error").takeIf { it.isNotEmpty() }?.let { throw IOException(it) }
+            result += songs(page)
+            onPage(result.toList())
+            offset += PAGE
+            if (offset >= page.optInt("total")) return result
+        }
     }
 
     private const val PAGE = 50

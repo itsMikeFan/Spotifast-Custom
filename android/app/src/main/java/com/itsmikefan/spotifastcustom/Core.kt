@@ -23,6 +23,9 @@ object Core {
     /** Adds a song to Spotify's queue, after the current one. */
     external fun queue(uri: String)
 
+    /** [count] songs of a playlist from [offset], read through the playback session, as Web API-shaped JSON or {"error": ...}. */
+    external fun playlistPage(uri: String, offset: Int, count: Int): String
+
     /** Spotify Connect and Cast receivers on the network as a JSON array, or {"error": ...}. Blocks for [timeoutMs]. */
     external fun receivers(timeoutMs: Int): String?
 
