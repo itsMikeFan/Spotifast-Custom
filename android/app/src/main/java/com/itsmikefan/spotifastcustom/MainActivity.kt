@@ -57,6 +57,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -235,6 +236,7 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
     var menuFor by remember { mutableStateOf<Track?>(null) }
     var adding by remember { mutableStateOf<Track?>(null) }
     var finding by remember { mutableStateOf(false) }
+    var unavailableOnly by remember(playlist.id) { mutableStateOf(false) }
     var public by remember(playlist.id) { mutableStateOf(playlist.public) }
     val playing by Playback.state.collectAsState()
     val scope = rememberCoroutineScope()
@@ -243,13 +245,19 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
         runCatching { Spotify.tracks(playlist) { tracks = it } }.onSuccess { tracks = it; complete = true }.onFailure { onError(it.message ?: "Could not load songs") }
     }
     val list = tracks ?: return Loading()
+    val unavailable = list.count { !it.playable }
     Column {
-        if (playlist.owned) {
+        if (playlist.owned || unavailable > 0) {
             Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(
-                    if (public == false) "Private" else "Public", color = Color.Gray, fontSize = 13.sp,
+                    if (!playlist.owned) "" else if (public == false) "Private" else "Public", color = Color.Gray, fontSize = 13.sp,
                     modifier = Modifier.padding(start = 8.dp).weight(1f),
                 )
+                // As on the desktop: shows only the songs Spotify says this account can't play.
+                if (unavailable > 0 || unavailableOnly) TextButton(onClick = { unavailableOnly = !unavailableOnly }) {
+                    Text(if (unavailableOnly) "Show all" else "Unavailable ($unavailable)")
+                }
+                if (playlist.owned) {
                 TextButton(onClick = {
                     val was = public
                     val now = was == false
@@ -265,11 +273,12 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
                 }) { Text(if (public == false) "Make public" else "Make private") }
                 // It needs every song, so it waits for the rest to load.
                 TextButton(onClick = { finding = true }, enabled = complete) { Text("Find duplicates") }
+                }
             }
             HorizontalDivider()
         }
         LazyColumn {
-            items(list) { t ->
+            items(if (unavailableOnly) list.filter { !it.playable } else list) { t ->
                 val current = t.uri == playing.uri
                 Box {
                     Row(
@@ -278,14 +287,22 @@ private fun Tracks(playlist: Playlist, targets: List<Playlist>, onPublic: (Boole
                                 onClick = { Playback.play(playlist.uri, t.uri, onError) },
                                 onLongClick = { menuFor = t },
                             )
-                            .padding(16.dp, 6.dp),
+                            .padding(start = 16.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        Cover(t.cover)
-                        Column(Modifier.padding(start = 12.dp)) {
-                            Text(t.name, maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (current) MaterialTheme.colorScheme.primary else Color.Unspecified)
-                            Text(t.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
+                        Box(Modifier.alpha(if (t.playable) 1f else 0.35f)) { Cover(t.cover) }
+                        Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                            Text(
+                                t.name, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                color = when { current -> MaterialTheme.colorScheme.primary; !t.playable -> Color.Gray; else -> Color.Unspecified },
+                            )
+                            Text(
+                                if (t.playable) t.artists else "Unavailable · ${t.artists}",
+                                maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp,
+                            )
                         }
+                        // The same menu as a long press, easier to find.
+                        TextButton(onClick = { menuFor = t }) { Text("⋮", fontSize = 20.sp, color = Color.Gray) }
                     }
                     DropdownMenu(expanded = menuFor === t, onDismissRequest = { menuFor = null }) {
                         DropdownMenuItem(text = { Text("Add to queue") }, onClick = { menuFor = null; Playback.queue(t.uri) })
@@ -434,25 +451,35 @@ private fun NowPlaying() {
             Text(time(state.durationMs), color = Color.Gray, fontSize = 12.sp)
         }
     }
-    if (upNext) AlertDialog(
-        onDismissRequest = { upNext = false },
+    if (upNext) UpNext(state.next) { upNext = false }
+}
+
+/** The songs after the current one, named even when they came from Spotify's own queue. */
+@Composable
+private fun UpNext(uris: List<String>, close: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = close,
         title = { Text("Up next") },
         text = {
-            if (state.next.isEmpty()) Text("Nothing after this song.")
-            else LazyColumn {
-                items(state.next) { uri ->
+            if (uris.isEmpty()) Text("Nothing after this song.")
+            // Full width, so a long title scrolling into view doesn't resize the box.
+            else LazyColumn(Modifier.fillMaxWidth()) {
+                items(uris) { uri ->
                     var t by remember(uri) { mutableStateOf(Spotify.known[uri]) }
                     // Songs queued in the Spotify app come over as bare URIs.
                     var looked by remember(uri) { mutableStateOf(false) }
                     if (t == null) LaunchedEffect(uri) { t = Spotify.lookup(uri); looked = true }
-                    Column(Modifier.padding(vertical = 6.dp)) {
-                        Text(t?.name ?: if (looked) uri else "…", maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        t?.let { s -> Text(s.artists, maxLines = 1, color = Color.Gray, fontSize = 12.sp) }
+                    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Cover(t?.cover)
+                        Column(Modifier.weight(1f).padding(start = 12.dp)) {
+                            Text(t?.name ?: if (looked) uri else "…", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            t?.let { s -> Text(s.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 12.sp) }
+                        }
                     }
                 }
             }
         },
-        confirmButton = { TextButton(onClick = { upNext = false }) { Text("Done") } },
+        confirmButton = { TextButton(onClick = close) { Text("Done") } },
     )
 }
 
@@ -468,6 +495,7 @@ private fun Cover(url: String?) {
 @Composable
 private fun RemoteBar(remote: Remote, changed: (Remote) -> Unit) {
     val scope = rememberCoroutineScope()
+    var queue by remember { mutableStateOf<List<String>?>(null) }
     fun send(command: Int) = scope.launch {
         runCatching { Spotify.remoteCommand(command) }
         delay(500)
@@ -483,6 +511,9 @@ private fun RemoteBar(remote: Remote, changed: (Remote) -> Unit) {
                 Text(remote.artists, maxLines = 1, overflow = TextOverflow.Ellipsis, color = Color.Gray, fontSize = 13.sp)
                 Text("Playing on ${remote.device}", maxLines = 1, color = MaterialTheme.colorScheme.primary, fontSize = 12.sp)
             }
+            TextButton(onClick = {
+                scope.launch { queue = runCatching { Spotify.remoteQueue() }.getOrDefault(emptyList()) }
+            }) { Text("Up next") }
         }
         Row(Modifier.fillMaxWidth(), Arrangement.SpaceEvenly, Alignment.CenterVertically) {
             TextButton(onClick = { send(Core.PREVIOUS) }) { Text("⏮", fontSize = 24.sp) }
@@ -492,6 +523,7 @@ private fun RemoteBar(remote: Remote, changed: (Remote) -> Unit) {
             TextButton(onClick = { send(Core.NEXT) }) { Text("⏭", fontSize = 24.sp) }
         }
     }
+    queue?.let { UpNext(it) { queue = null } }
 }
 
 /** Spotify Connect devices, plus Connect and Cast speakers found on the network; tapping one moves playback there. */

@@ -29,6 +29,8 @@ data class Playlist(
 data class Track(
     val uri: String, val name: String, val artists: String, val lead: String, val durationMs: Int,
     val cover: String? = null,
+    /** False when Spotify says this account can't play it, as the desktop greys out. */
+    val playable: Boolean = true,
 )
 data class Device(val id: String, val name: String, val type: String, val active: Boolean)
 /** What plays on another Spotify Connect device. */
@@ -280,7 +282,7 @@ object Spotify {
 
     private const val PAGE = 50
     /** Only what a song row needs; without it every song carries its full album and market list. */
-    private val ITEM_FIELDS = "uri,name,duration_ms,artists(name),album(images)".let { song ->
+    private val ITEM_FIELDS = "uri,name,duration_ms,is_playable,is_local,artists(name),album(images)".let { song ->
         URLEncoder.encode("total,next,items(item($song),track($song))", "UTF-8")
     }
 
@@ -300,6 +302,8 @@ object Spotify {
         return Track(
             uri, t.optString("name"), names.joinToString(", "), names.firstOrNull() ?: "", t.optInt("duration_ms"),
             image(t.optJSONObject("album")?.optJSONArray("images")),
+            // Only a definite "false" counts; local files and missing answers stay playable, as on the desktop.
+            playable = t.optBoolean("is_local") || !t.has("is_playable") || t.optBoolean("is_playable", true),
         ).also { known[uri] = it }
     }
 
@@ -334,6 +338,12 @@ object Spotify {
             o.optJSONObject("device")?.optString("name") ?: "", o.optBoolean("is_playing"), item.optString("name"), artists,
             image(item.optJSONObject("album")?.optJSONArray("images")),
         )
+    }
+
+    /** What plays after the current song on whichever device is active. */
+    suspend fun remoteQueue(): List<String> {
+        val queue = get("/me/player/queue").optJSONArray("queue") ?: return emptyList()
+        return (0 until queue.length()).mapNotNull { queue.optJSONObject(it)?.let(::song)?.uri }
     }
 
     /** Play, pause, next or previous on the active device. */
