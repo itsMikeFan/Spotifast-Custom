@@ -176,7 +176,7 @@ object Playback {
     fun queue(uri: String, onError: (String) -> Unit) {
         scope.launch {
             if (remoteActive && !state.value.playing) {
-                runCatching { Spotify.queueRemote(uri) }.onFailure { onError("Could not queue it: ${it.message}") }
+                attempt { Spotify.queueRemote(uri) }.onFailure { onError("Could not queue it: ${it.message}") }
                 return@launch
             }
             connect()?.let { onError(it); return@launch }
@@ -192,7 +192,7 @@ object Playback {
         }
     }
 
-    private fun parse(json: String): PlayState = runCatching {
+    private fun parse(json: String): PlayState = attempt {
         val o = JSONObject(json)
         PlayState(
             o.optBoolean("connected"), o.optBoolean("playing"), o.optString("uri"), o.optString("name"),

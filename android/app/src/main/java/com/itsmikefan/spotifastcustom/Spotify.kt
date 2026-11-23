@@ -208,7 +208,7 @@ object Spotify {
             http.newCall(request).execute().use { response ->
                 val text = response.body?.string().orEmpty()
                 when {
-                    response.isSuccessful -> return@withContext text.takeIf { it.isNotBlank() }?.let { runCatching { JSONObject(it) }.getOrNull() }
+                    response.isSuccessful -> return@withContext text.takeIf { it.isNotBlank() }?.let { attempt { JSONObject(it) }.getOrNull() }
                     response.code == 401 && !refreshed -> refreshed = true
                     response.code == 429 && !waited -> {
                         waited = true
@@ -340,7 +340,7 @@ object Spotify {
     suspend fun lookup(uri: String): Track? {
         known[uri]?.let { return it }
         val id = uri.removePrefix("spotify:track:").takeIf { it != uri } ?: return null
-        return runCatching { song(get("/tracks/$id?market=from_token")) }.getOrNull()
+        return attempt { song(get("/tracks/$id?market=from_token")) }.getOrNull()
     }
 
     /** The smallest image, which is plenty for a row; Spotify lists the largest first. */
@@ -416,7 +416,7 @@ object Spotify {
     }
 
     /** What Spotify now says about the playlist's visibility, read after a change. */
-    suspend fun publicNow(playlist: Playlist): Boolean? = runCatching {
+    suspend fun publicNow(playlist: Playlist): Boolean? = attempt {
         // Spotify's reads lag a change a little, as the desktop found.
         kotlinx.coroutines.delay(2000)
         get("/playlists/${playlist.id}?fields=public").let { if (it.isNull("public")) null else it.optBoolean("public") }
@@ -444,4 +444,16 @@ object Spotify {
         val data = ByteArray(bytes).also { SecureRandom().nextBytes(it) }
         return Base64.encodeToString(data, Base64.URL_SAFE or Base64.NO_PADDING or Base64.NO_WRAP)
     }
+}
+
+/**
+ * runCatching that lets coroutine cancellation through: a screen closing
+ * mid-request cancels it, and that is not an error to show.
+ */
+inline fun <T> attempt(block: () -> T): Result<T> = try {
+    Result.success(block())
+} catch (e: kotlinx.coroutines.CancellationException) {
+    throw e
+} catch (e: Throwable) {
+    Result.failure(e)
 }

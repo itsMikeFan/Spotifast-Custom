@@ -1,5 +1,6 @@
 package com.itsmikefan.spotifastcustom.ui
 
+import com.itsmikefan.spotifastcustom.attempt
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -59,7 +60,7 @@ fun SettingsScreen(openEffects: () -> Unit, signOut: () -> Unit, offerUpdate: (U
     var importError by remember { mutableStateOf<String?>(null) }
     val importer = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
-        runCatching {
+        attempt {
             val name = context.contentResolver.query(uri, null, null, null, null)?.use { c ->
                 val i = c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
                 if (c.moveToFirst() && i >= 0) c.getString(i) else null

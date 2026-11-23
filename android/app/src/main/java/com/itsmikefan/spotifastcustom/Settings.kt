@@ -77,7 +77,7 @@ object Settings {
                 volume = getInt("volume", d.volume),
                 volumeKeysApp = getBoolean("volume_keys_app", d.volumeKeysApp),
                 checkForUpdates = getBoolean("check_for_updates", d.checkForUpdates),
-                searchHistory = runCatching {
+                searchHistory = attempt {
                     val a = JSONArray(getString("search_history", "[]"))
                     (0 until a.length()).map { a.getString(it) }
                 }.getOrDefault(emptyList()),

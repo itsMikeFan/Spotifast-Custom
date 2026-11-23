@@ -111,7 +111,7 @@ private fun SongSheet(t: Track, nav: Nav, close: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var liked by remember(t.uri) { mutableStateOf<Boolean?>(null) }
-    LaunchedEffect(t.uri) { if (t.uri.startsWith("spotify:track:")) liked = runCatching { Spotify.liked(listOf(t.uri)).firstOrNull() }.getOrNull() }
+    LaunchedEffect(t.uri) { if (t.uri.startsWith("spotify:track:")) liked = attempt { Spotify.liked(listOf(t.uri)).firstOrNull() }.getOrNull() }
     Row(Modifier.padding(horizontal = 20.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
         Cover(t.cover, 52.dp)
         Column(Modifier.padding(start = 12.dp)) {
@@ -126,7 +126,7 @@ private fun SongSheet(t: Track, nav: Nav, close: () -> Unit) {
     liked?.let { now ->
         SheetItem(if (now) Icons.HeartFilled else Icons.Heart, if (now) "Remove from Liked Songs" else "Save to Liked Songs") {
             close()
-            scope.launch { runCatching { Spotify.setLiked(t.uri, !now) }.onFailure { nav.error("Could not change Liked Songs: ${it.message}") } }
+            scope.launch { attempt { Spotify.setLiked(t.uri, !now) }.onFailure { nav.error("Could not change Liked Songs: ${it.message}") } }
         }
     }
     if (t.albumUri.startsWith("spotify:album:")) SheetItem(Icons.Music, "Go to album") {
@@ -149,7 +149,7 @@ private fun AddToPlaylist(song: Track, nav: Nav, close: () -> Unit) {
     var checking by remember { mutableStateOf(false) }
     var duplicate by remember { mutableStateOf<Pair<Playlist, Track>?>(null) }
     fun add(target: Playlist) = scope.launch {
-        runCatching { Spotify.add(target, listOf(song.uri)) }.onFailure { nav.error(it.message ?: "Could not add it") }
+        attempt { Spotify.add(target, listOf(song.uri)) }.onFailure { nav.error(it.message ?: "Could not add it") }
         close()
     }
     val dup = duplicate
@@ -172,7 +172,7 @@ private fun AddToPlaylist(song: Track, nav: Nav, close: () -> Unit) {
                     checking = true
                     scope.launch {
                         val key = Dupes.key(song)
-                        runCatching { Spotify.tracks(target) }
+                        attempt { Spotify.tracks(target) }
                             .onSuccess { songs ->
                                 val existing = songs.firstOrNull { Dupes.key(it) == key }
                                 if (existing != null) duplicate = target to existing else add(target)
@@ -226,7 +226,7 @@ private fun FindDuplicates(playlist: Playlist, tracks: List<Track>, nav: Nav, cl
         busy = true
         scope.launch {
             val (uris, readd) = Dupes.plan(tracks.map { it.uri }, remove)
-            runCatching {
+            attempt {
                 Spotify.remove(playlist, uris)
                 for ((uri, position) in readd) Spotify.add(playlist, listOf(uri), position)
             }.onFailure { nav.error(it.message ?: "Could not remove them") }
@@ -292,23 +292,23 @@ private fun Devices(close: () -> Unit) {
     var searching by remember { mutableStateOf(true) }
     var status by remember { mutableStateOf<String?>(null) }
     LaunchedEffect(Unit) {
-        runCatching { Spotify.devices() }.onSuccess { devices = it }.onFailure { status = it.message; devices = emptyList() }
+        attempt { Spotify.devices() }.onSuccess { devices = it }.onFailure { status = it.message; devices = emptyList() }
         val found = withContext(Dispatchers.IO) {
             // Android drops multicast unless an app holds this lock.
             val wifi = context.applicationContext.getSystemService(android.net.wifi.WifiManager::class.java)
             val lock = wifi?.createMulticastLock("spotifast:discovery")?.apply { setReferenceCounted(false); acquire() }
             try { Core.receivers(3000) } finally { lock?.release() }
         }
-        runCatching {
+        attempt {
             val array = org.json.JSONArray(found ?: "[]")
             nearby = (0 until array.length()).map { array.getJSONObject(it) }
-        }.onFailure { status = runCatching { JSONObject(found ?: "").optString("error") }.getOrNull() ?: it.message }
+        }.onFailure { status = attempt { JSONObject(found ?: "").optString("error") }.getOrNull() ?: it.message }
         searching = false
     }
     fun move(id: String, name: String) {
         status = "Moving playback to $name…"
         scope.launch {
-            runCatching { Spotify.transfer(id) }
+            attempt { Spotify.transfer(id) }
                 .onSuccess { close() }
                 .onFailure { status = "Could not move playback to $name: ${it.message}" }
         }
@@ -326,7 +326,7 @@ private fun Devices(close: () -> Unit) {
             // The speaker joins Spotify Connect a moment after it signs in.
             val id = row.optString("device_id")
             repeat(15) {
-                val listed = runCatching { Spotify.devices() }.getOrNull().orEmpty()
+                val listed = attempt { Spotify.devices() }.getOrNull().orEmpty()
                 listed.firstOrNull { it.id == id || it.name == name }?.let { move(it.id, name); return@launch }
                 delay(1000)
             }
@@ -345,7 +345,7 @@ private fun Devices(close: () -> Unit) {
                     Playback.connect()?.let { status = it; return@launch }
                     if (here != null) return@launch move(here.id, "this phone")
                     delay(1500)
-                    runCatching { Spotify.devices() }.getOrNull()?.firstOrNull { it.name == Playback.deviceName }
+                    attempt { Spotify.devices() }.getOrNull()?.firstOrNull { it.name == Playback.deviceName }
                         ?.let { move(it.id, "this phone") } ?: run { status = "This phone is ready. Pick it again in a moment." }
                 }
             }
@@ -374,7 +374,7 @@ private fun DeviceVolume(start: Int) {
         Icon(volumeIcon(Math.round(level)), null, Modifier.size(18.dp), tint = p.secondary)
         Slider(
             level, { level = it }, valueRange = 0f..100f, modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
-            onValueChangeFinished = { scope.launch { runCatching { Spotify.remoteVolume(Math.round(level)) } } },
+            onValueChangeFinished = { scope.launch { attempt { Spotify.remoteVolume(Math.round(level)) } } },
         )
     }
 }

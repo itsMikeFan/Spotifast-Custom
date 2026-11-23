@@ -57,7 +57,7 @@ fun SearchScreen(playlists: List<Playlist>, nav: Nav) {
     fun load() {
         loading = true
         scope.launch {
-            runCatching { Spotify.search(query, results?.size ?: 0) }
+            attempt { Spotify.search(query, results?.size ?: 0) }
                 .onSuccess { page -> results = results.orEmpty() + page; more = page.isNotEmpty() }
                 .onFailure { nav.error(it.message ?: "Search failed"); results = results.orEmpty(); more = false }
             loading = false

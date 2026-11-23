@@ -76,9 +76,9 @@ private fun shown(remote: Remote?): Shown {
 private fun send(remote: Remote?, command: Int, scope: kotlinx.coroutines.CoroutineScope, onRemote: (Remote) -> Unit) {
     if (remote == null) return Playback.command(command)
     scope.launch {
-        runCatching { Spotify.remoteCommand(command) }
+        attempt { Spotify.remoteCommand(command) }
         delay(500)
-        runCatching { Spotify.remote() }.getOrNull()?.let(onRemote)
+        attempt { Spotify.remote() }.getOrNull()?.let(onRemote)
     }
 }
 
@@ -88,11 +88,11 @@ private fun LikeButton(uri: String, size: androidx.compose.ui.unit.Dp = 22.dp, n
     val p = LocalPalette.current
     val scope = rememberCoroutineScope()
     var liked by remember(uri) { mutableStateOf<Boolean?>(null) }
-    LaunchedEffect(uri) { if (uri.startsWith("spotify:track:")) liked = runCatching { Spotify.liked(listOf(uri)).firstOrNull() }.getOrNull() }
+    LaunchedEffect(uri) { if (uri.startsWith("spotify:track:")) liked = attempt { Spotify.liked(listOf(uri)).firstOrNull() }.getOrNull() }
     val now = liked ?: return
     IconBtn(if (now) Icons.HeartFilled else Icons.Heart, if (now) "Remove from Liked Songs" else "Save to Liked Songs", size, tint = if (now) p.accent else p.secondary) {
         liked = !now
-        scope.launch { runCatching { Spotify.setLiked(uri, !now) }.onFailure { liked = now; nav.error("Could not change Liked Songs: ${it.message}") } }
+        scope.launch { attempt { Spotify.setLiked(uri, !now) }.onFailure { liked = now; nav.error("Could not change Liked Songs: ${it.message}") } }
     }
 }
 
@@ -220,7 +220,7 @@ fun FullPlayer(remote: Remote?, onRemote: (Remote) -> Unit, nav: Nav, close: () 
             IconBtn(Icons.AudioLines, "Effects", on = Playback.effects.collectAsState().value.on) { nav.sheet(Sheet.Effects) }
             IconBtn(Icons.ListMusic, "Up next") {
                 if (remote == null) nav.sheet(Sheet.UpNext(state.next))
-                else scope.launch { nav.sheet(Sheet.UpNext(runCatching { Spotify.remoteQueue() }.getOrDefault(emptyList()))) }
+                else scope.launch { nav.sheet(Sheet.UpNext(attempt { Spotify.remoteQueue() }.getOrDefault(emptyList()))) }
             }
         }
     }
@@ -260,7 +260,7 @@ fun VolumeRow(remote: Remote?, onRemote: (Remote) -> Unit) {
                 dragging = null
                 if (remote != null && v != null) {
                     onRemote(remote.copy(volume = v))
-                    scope.launch { runCatching { Spotify.remoteVolume(v) } }
+                    scope.launch { attempt { Spotify.remoteVolume(v) } }
                 }
             },
             colors = SliderDefaults.colors(thumbColor = p.text, activeTrackColor = p.text, inactiveTrackColor = p.surfaceActive),

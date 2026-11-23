@@ -97,13 +97,13 @@ private fun Main(offer: (Updates.Update) -> Unit, signOut: () -> Unit) {
     val local by Playback.state.collectAsState()
     val p = LocalPalette.current
     LaunchedEffect(Unit) {
-        runCatching { Spotify.playlists() }.onSuccess { playlists = it }.onFailure { error = it.message }
+        attempt { Spotify.playlists() }.onSuccess { playlists = it }.onFailure { error = it.message }
     }
     // What plays on another device, while this phone is not playing.
     LaunchedEffect(Unit) {
         while (true) {
             remote = if (Playback.state.value.playing) null
-            else runCatching { Spotify.remote() }.getOrNull()?.takeIf { it.device != Playback.deviceName }
+            else attempt { Spotify.remote() }.getOrNull()?.takeIf { it.device != Playback.deviceName }
             Playback.remoteActive = remote != null
             kotlinx.coroutines.delay(3000)
         }
@@ -208,7 +208,7 @@ private fun UpdatePrompt(offered: Updates.Update?, done: () -> Unit) {
             TextButton(enabled = !busy, onClick = {
                 busy = true; error = null
                 scope.launch {
-                    runCatching { Updates.install(context, found) }
+                    attempt { Updates.install(context, found) }
                         .onSuccess { update = null }
                         .onFailure { error = "Could not download it: ${it.message}" }
                     busy = false
@@ -252,7 +252,7 @@ private fun SignIn(done: () -> Unit) {
                 busy = true; error = null
                 Spotify.clientId = clientId
                 scope.launch {
-                    runCatching { Spotify.signIn(context) }
+                    attempt { Spotify.signIn(context) }
                         // Asked again for new permissions: playback is already allowed.
                         .onSuccess { if (Playback.hasPlaybackSignIn) done() else webDone = true }
                         .onFailure { error = it.message }
@@ -264,7 +264,7 @@ private fun SignIn(done: () -> Unit) {
             PillButton("Allow playback", enabled = !busy) {
                 busy = true; error = null
                 scope.launch {
-                    runCatching { Playback.connect(Spotify.playbackToken(context)) }
+                    attempt { Playback.connect(Spotify.playbackToken(context)) }
                         .onSuccess { failed -> if (failed == null) done() else error = failed }
                         .onFailure { error = it.message }
                     busy = false

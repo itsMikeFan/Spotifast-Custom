@@ -68,7 +68,7 @@ fun PlaylistScreen(playlist: Playlist, nav: Nav, back: () -> Unit, onPublic: (Bo
         complete = false
         // Album songs come without their album, so they borrow its cover.
         fun fill(list: List<Track>) = if (playlist.uri.startsWith("spotify:album:")) list.map { it.copy(cover = it.cover ?: playlist.cover, bigCover = it.bigCover ?: playlist.bigCover) } else list
-        runCatching { Spotify.tracks(playlist) { tracks = fill(it) } }
+        attempt { Spotify.tracks(playlist) { tracks = fill(it) } }
             .onSuccess { tracks = fill(it); complete = true }
             .onFailure { nav.error(it.message ?: "Could not load songs") }
     }
@@ -118,7 +118,7 @@ fun PlaylistScreen(playlist: Playlist, nav: Nav, back: () -> Unit, onPublic: (Bo
                         public = now
                         onPublic(now)
                         scope.launch {
-                            runCatching { Spotify.setPublic(playlist, now) }
+                            attempt { Spotify.setPublic(playlist, now) }
                                 .onSuccess { Spotify.publicNow(playlist)?.takeIf { it != now }?.let {
                                     nav.error("Spotify took the change but still lists this playlist as ${if (it) "public" else "private"}.")
                                 } }
