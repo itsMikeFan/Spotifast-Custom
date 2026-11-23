@@ -27,6 +27,9 @@ data class PlayState(
     val positionMs: Int = 0,
     /** Upcoming song URIs: the queue, then the rest of the playlist. */
     val next: List<String> = emptyList(),
+    val shuffle: Boolean = false,
+    /** 0 off, 1 the playlist, 2 this song. */
+    val repeat: Int = 0,
 )
 
 data class Effects(
@@ -100,11 +103,16 @@ object Playback {
     }
 
     /** Plays [track] within [context], starting the background service first. */
-    fun play(context: String, track: String?, onError: (String) -> Unit) {
+    fun play(context: String, track: String?, onError: (String) -> Unit) = load(context, track, -1, onError)
+
+    /** Plays a whole playlist from the top, or shuffled. */
+    fun playShuffled(context: String, shuffle: Boolean, onError: (String) -> Unit) = load(context, null, if (shuffle) 1 else 0, onError)
+
+    private fun load(context: String, track: String?, shuffle: Int, onError: (String) -> Unit) {
         ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))
         scope.launch {
             connect()?.let { onError(it); return@launch }
-            withContext(Dispatchers.IO) { Core.load(context, track) }
+            withContext(Dispatchers.IO) { Core.load(context, track, shuffle) }
         }
     }
 
@@ -137,6 +145,7 @@ object Playback {
             o.optBoolean("connected"), o.optBoolean("playing"), o.optString("uri"), o.optString("name"),
             o.optString("artists"), o.optInt("duration_ms"), o.optInt("position_ms"),
             o.optJSONArray("next")?.let { a -> (0 until a.length()).map { a.getString(it) } } ?: emptyList(),
+            o.optBoolean("shuffle"), o.optInt("repeat"),
         )
     }.getOrDefault(PlayState())
 }

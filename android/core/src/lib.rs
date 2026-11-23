@@ -28,7 +28,9 @@ use jni::JNIEnv;
 use jni::JavaVM;
 use jni::objects::{GlobalRef, JObject, JString, JValue};
 use jni::sys::{jboolean, jfloat, jint, jstring};
-use librespot_connect::{ConnectConfig, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc};
+use librespot_connect::{
+    ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc,
+};
 use librespot_core::authentication::Credentials;
 use librespot_core::cache::Cache;
 use librespot_core::config::{DeviceType, SessionConfig};
@@ -83,6 +85,9 @@ struct State {
     /// Where the song was when `at` was taken.
     position_ms: u32,
     at: Option<Instant>,
+    shuffle: bool,
+    repeat_context: bool,
+    repeat_track: bool,
 }
 
 impl State {
@@ -107,6 +112,9 @@ impl State {
             "artists": self.artists,
             "duration_ms": self.duration_ms,
             "position_ms": self.position_now(rate),
+            "shuffle": self.shuffle,
+            // 0 off, 1 the playlist, 2 this song.
+            "repeat": if self.repeat_track { 2 } else if self.repeat_context { 1 } else { 0 },
         })
         .to_string()
     }
@@ -303,6 +311,11 @@ async fn follow(mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>) {
             PlayerEvent::Paused { position_ms, .. } => state.at(position_ms, false),
             PlayerEvent::Loading { position_ms, .. } => state.at(position_ms, false),
             PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } => state.playing = false,
+            PlayerEvent::ShuffleChanged { shuffle } => state.shuffle = shuffle,
+            PlayerEvent::RepeatChanged { context, track } => {
+                state.repeat_context = context;
+                state.repeat_track = track;
+            }
             _ => {}
         }
     }
@@ -374,6 +387,7 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_load<'a>(
     _this: JObject<'a>,
     context: JString<'a>,
     track: JString<'a>,
+    shuffle: jint,
 ) {
     let Some(context) = string(&mut env, &context) else {
         return;
@@ -396,6 +410,13 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_load<'a>(
                 LoadRequestOptions {
                     start_playing: true,
                     playing_track: track.map(PlayingTrack::Uri),
+                    // -1 keeps the current shuffle; 0 or 1 starts the playlist with it off or on.
+                    context_options: (shuffle >= 0).then(|| {
+                        LoadContextOptions::Options(librespot_connect::Options {
+                            shuffle: shuffle == 1,
+                            ..Default::default()
+                        })
+                    }),
                     ..LoadRequestOptions::default()
                 },
             ))
@@ -447,6 +468,11 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_command(
             2 => spirc.next(),
             3 => spirc.prev(),
             4 => spirc.set_position_ms(value.max(0) as u32),
+            5 => spirc.shuffle(value != 0),
+            // 0 off, 1 the playlist, 2 this song.
+            6 => spirc
+                .repeat(value == 1)
+                .and_then(|()| spirc.repeat_track(value == 2)),
             _ => Ok(()),
         })
     });

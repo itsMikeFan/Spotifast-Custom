@@ -14,8 +14,8 @@ object Core {
     /** Returns null when connected, or why it failed. A null token reuses the saved playback sign-in. */
     external fun connect(out: AudioOut, cacheDir: String, token: String?, deviceName: String): String?
 
-    /** Plays [context] (a playlist URI or Liked Songs) starting at [track]. */
-    external fun load(context: String, track: String?)
+    /** Plays [context] (a playlist URI or Liked Songs) starting at [track]; [shuffle] -1 keeps it, 0 off, 1 on. */
+    external fun load(context: String, track: String?, shuffle: Int)
 
     external fun command(command: Int, value: Int)
 
@@ -41,6 +41,10 @@ object Core {
     const val NEXT = 2
     const val PREVIOUS = 3
     const val SEEK = 4
+    /** Value 1 on, 0 off. */
+    const val SHUFFLE = 5
+    /** Value 0 off, 1 the playlist, 2 this song. */
+    const val REPEAT = 6
 }
 
 /** Where the core's audio goes. Called from the core's player thread. */

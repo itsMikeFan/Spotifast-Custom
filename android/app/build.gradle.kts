@@ -50,6 +50,8 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // Covers.
     implementation("io.coil-kt:coil-compose:2.7.0")
+    // Album-art colours for tints and the visualizer.
+    implementation("androidx.palette:palette-ktx:1.0.0")
     testImplementation("junit:junit:4.13.2")
     // Android's own org.json is a stub in unit tests.
     testImplementation("org.json:json:20240303")

@@ -25,16 +25,21 @@ import java.security.SecureRandom
 data class Playlist(
     val name: String, val uri: String, val tracksPath: String, val count: Int,
     val id: String = "", val owned: Boolean = false, val public: Boolean? = null, val cover: String? = null,
+    val owner: String = "", val bigCover: String? = null,
 )
 data class Track(
     val uri: String, val name: String, val artists: String, val lead: String, val durationMs: Int,
     val cover: String? = null,
     /** False when Spotify says this account can't play it, as the desktop greys out. */
     val playable: Boolean = true,
+    val album: String = "", val albumUri: String = "", val bigCover: String? = null,
 )
 data class Device(val id: String, val name: String, val type: String, val active: Boolean)
 /** What plays on another Spotify Connect device. */
-data class Remote(val device: String, val playing: Boolean, val name: String, val artists: String, val cover: String?)
+data class Remote(
+    val device: String, val playing: Boolean, val name: String, val artists: String, val cover: String?,
+    val volume: Int = -1, val canSetVolume: Boolean = true, val uri: String = "",
+)
 
 /**
  * Sign-in and the Web API, the same two grants as the desktop's src/auth.rs:
@@ -250,10 +255,12 @@ object Spotify {
                 // Newer apps get "items", older ones "tracks", for the count.
                 val count = (p.optJSONObject("items") ?: p.optJSONObject("tracks"))?.optInt("total", -1) ?: -1
                 val owner = p.optJSONObject("owner")?.optString("id")
+                val ownerName = p.optJSONObject("owner")?.optString("display_name")?.takeIf { it.isNotEmpty() && it != "null" } ?: owner.orEmpty()
                 val public = if (p.isNull("public")) null else p.optBoolean("public")
                 result += Playlist(
                     p.optString("name"), p.getString("uri"), "/playlists/$id/items?limit=50&market=from_token&fields=$ITEM_FIELDS", count,
                     id, owner == userId, public, image(p.optJSONArray("images")),
+                    ownerName, bigImage(p.optJSONArray("images")),
                 )
             }
             next = page.optString("next").takeIf { it.isNotEmpty() && it != "null" }
@@ -282,7 +289,7 @@ object Spotify {
 
     private const val PAGE = 50
     /** Only what a song row needs; without it every song carries its full album and market list. */
-    private val ITEM_FIELDS = "uri,name,duration_ms,is_playable,is_local,artists(name),album(images)".let { song ->
+    private val ITEM_FIELDS = "uri,name,duration_ms,is_playable,is_local,artists(name),album(name,uri,images)".let { song ->
         URLEncoder.encode("total,next,items(item($song),track($song))", "UTF-8")
     }
 
@@ -304,6 +311,9 @@ object Spotify {
             image(t.optJSONObject("album")?.optJSONArray("images")),
             // Only a definite "false" counts; local files and missing answers stay playable, as on the desktop.
             playable = t.optBoolean("is_local") || !t.has("is_playable") || t.optBoolean("is_playable", true),
+            album = t.optJSONObject("album")?.optString("name").orEmpty(),
+            albumUri = t.optJSONObject("album")?.optString("uri").orEmpty(),
+            bigCover = bigImage(t.optJSONObject("album")?.optJSONArray("images")),
         ).also { known[uri] = it }
     }
 
@@ -317,6 +327,35 @@ object Spotify {
     /** The smallest image, which is plenty for a row; Spotify lists the largest first. */
     private fun image(images: JSONArray?): String? =
         images?.takeIf { it.length() > 0 }?.let { it.optJSONObject(it.length() - 1) }?.optString("url")?.takeIf { it.isNotEmpty() }
+
+    /** The largest image, for headers and the full-screen player. */
+    private fun bigImage(images: JSONArray?): String? =
+        images?.takeIf { it.length() > 0 }?.optJSONObject(0)?.optString("url")?.takeIf { it.isNotEmpty() }
+
+    /** Whether each of [uris] is in Liked Songs. */
+    suspend fun liked(uris: List<String>): List<Boolean> {
+        // The contains endpoint answers with a bare JSON array, which [call] can't parse as an object.
+        return containsRaw(uris.map { it.substringAfterLast(":") })
+    }
+
+    private suspend fun containsRaw(ids: List<String>): List<Boolean> = withContext(Dispatchers.IO) {
+        val request = okhttp3.Request.Builder().url("https://api.spotify.com/v1/me/tracks/contains?ids=${ids.joinToString(",")}")
+            .header("Authorization", "Bearer ${accessToken()}").build()
+        http.newCall(request).execute().use { r ->
+            val a = JSONArray(r.body?.string() ?: "[]")
+            (0 until a.length()).map { a.optBoolean(it) }
+        }
+    }
+
+    suspend fun setLiked(uri: String, liked: Boolean) {
+        val ids = JSONObject().put("ids", JSONArray(listOf(uri.substringAfterLast(":"))))
+        call(if (liked) "PUT" else "DELETE", "/me/tracks", ids)
+    }
+
+    /** Sets the volume of the device that is playing, 0 to 100. */
+    suspend fun remoteVolume(percent: Int) {
+        call("PUT", "/me/player/volume?volume_percent=${percent.coerceIn(0, 100)}", null)
+    }
 
     suspend fun devices(): List<Device> {
         val list = get("/me/player/devices").optJSONArray("devices") ?: return emptyList()
@@ -334,9 +373,11 @@ object Spotify {
         val o = call("GET", "/me/player", null) ?: return null
         val item = o.optJSONObject("item") ?: return null
         val artists = item.optJSONArray("artists")?.let { a -> (0 until a.length()).joinToString(", ") { a.getJSONObject(it).optString("name") } } ?: ""
+        val device = o.optJSONObject("device")
         return Remote(
-            o.optJSONObject("device")?.optString("name") ?: "", o.optBoolean("is_playing"), item.optString("name"), artists,
+            device?.optString("name") ?: "", o.optBoolean("is_playing"), item.optString("name"), artists,
             image(item.optJSONObject("album")?.optJSONArray("images")),
+            device?.optInt("volume_percent", -1) ?: -1, device?.optBoolean("supports_volume", true) ?: true, item.optString("uri"),
         )
     }
 
