@@ -28,8 +28,11 @@ object Core {
     /** Starts Spotify on a receiver row from [receivers] and signs it in; null on success, else why not. */
     external fun activate(receiver: String): String?
 
-    /** The visualizer's bar heights, 0 to 1. */
+    /** The visualizer's 75 bar heights then their 75 peak caps, 0 to 1. */
     external fun bands(): FloatArray
+
+    /** The waveform: [points] values from -1 to 1. */
+    external fun scope(points: Int): FloatArray
 
     /** The app's volume, 0 to 100, applied after the visualizer; Spotify Connect hears of it too. */
     external fun setVolume(percent: Int)

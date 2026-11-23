@@ -433,6 +433,5 @@ private fun Labelled(label: String, value: String, hint: String? = null, content
     content()
 }
 
-/** Filled in by the visualizer build. */
 @Composable
-private fun VisualizerSheet() {}
+private fun VisualizerSheet() = VisualizerOptions()

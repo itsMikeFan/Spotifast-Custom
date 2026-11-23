@@ -112,7 +112,7 @@ fun PlayerBar(remote: Remote?, onRemote: (Remote) -> Unit, nav: Nav, open: () ->
         }
         Box(Modifier.fillMaxWidth().height(64.dp)) {
             // The visualizer moves behind the bar's words, as on the desktop.
-            if (remote == null) Bars(now.playing, Modifier.fillMaxSize().padding(horizontal = 0.dp), alpha = 0.28f)
+            if (remote == null) Visualizer(now.playing, now.cover, Modifier.fillMaxSize(), alpha = 0.45f)
             Row(
                 Modifier.fillMaxSize()
                     .pointerInput(remote) {
@@ -176,8 +176,8 @@ fun FullPlayer(remote: Remote?, onRemote: (Remote) -> Unit, nav: Nav, close: () 
         }
         Spacer(Modifier.weight(0.5f))
         Cover(now.bigCover, 600.dp, Modifier.fillMaxWidth().aspectRatio(1f).clip(Radius))
-        if (remote == null) Bars(
-            now.playing, Modifier.fillMaxWidth().height(64.dp).padding(vertical = 6.dp).combinedClickableLong { if (s.playerBarVisClick) nav.sheet(Sheet.Visualizer) },
+        if (remote == null) Visualizer(
+            now.playing, now.cover, Modifier.fillMaxWidth().height(64.dp).padding(vertical = 6.dp).combinedClickableLong { if (s.playerBarVisClick) nav.sheet(Sheet.Visualizer) },
         )
         else Spacer(Modifier.height(64.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -273,30 +273,3 @@ fun VolumeRow(remote: Remote?, onRemote: (Remote) -> Unit) {
 
 @OptIn(ExperimentalFoundationApi::class)
 private fun Modifier.combinedClickableLong(onLong: () -> Unit) = this.combinedClickable(onClick = {}, onLongClick = onLong)
-
-/** The visualizer: bars from the core's spectrum, about 30 times a second while playing. */
-@Composable
-fun Bars(playing: Boolean, modifier: Modifier, alpha: Float = 1f) {
-    var levels by remember { mutableStateOf(FloatArray(0)) }
-    LaunchedEffect(playing) {
-        if (!playing) {
-            levels = FloatArray(0)
-            return@LaunchedEffect
-        }
-        while (true) {
-            val next = withContext(Dispatchers.Default) { Core.bands() }
-            // Rise at once, fall gently, like a classic analyser.
-            levels = FloatArray(next.size) { i -> maxOf(next[i], (levels.getOrNull(i) ?: 0f) - 0.04f) }
-            delay(33)
-        }
-    }
-    val color = LocalPalette.current.accent.copy(alpha = alpha)
-    Canvas(modifier) {
-        if (levels.isEmpty()) return@Canvas
-        val slot = size.width / levels.size
-        levels.forEachIndexed { i, level ->
-            val h = size.height * level.coerceIn(0.02f, 1f)
-            drawRect(color, topLeft = Offset(i * slot + slot * 0.15f, size.height - h), size = Size(slot * 0.7f, h))
-        }
-    }
-}

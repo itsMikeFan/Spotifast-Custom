@@ -312,9 +312,17 @@ async fn follow(mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>) {
                 let playing = state.playing || matches!(event, PlayerEvent::Playing { .. });
                 state.at(position_ms, playing);
             }
-            PlayerEvent::Paused { position_ms, .. } => state.at(position_ms, false),
+            PlayerEvent::Paused { position_ms, .. } => {
+                // Let the bars fall rather than freeze on the last sound.
+                vis::clear();
+                state.at(position_ms, false)
+            }
             PlayerEvent::Loading { position_ms, .. } => state.at(position_ms, false),
-            PlayerEvent::Stopped { .. } | PlayerEvent::EndOfTrack { .. } => state.playing = false,
+            PlayerEvent::Stopped { .. } => {
+                vis::clear();
+                state.playing = false;
+            }
+            PlayerEvent::EndOfTrack { .. } => state.playing = false,
             PlayerEvent::ShuffleChanged { shuffle } => state.shuffle = shuffle,
             PlayerEvent::RepeatChanged { context, track } => {
                 state.repeat_context = context;
@@ -444,13 +452,29 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_queue<'a>(
     });
 }
 
-/// The visualizer's bar heights, 0 to 1, from the most recent sound.
+/// The waveform: `points` values from -1 to 1.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_scope<'a>(
+    env: JNIEnv<'a>,
+    _this: JObject<'a>,
+    points: jint,
+) -> jni::sys::jfloatArray {
+    let points = points.clamp(1, 400) as usize;
+    let line = guard(vec![0.0; points], || vis::scope(points));
+    let Ok(array) = env.new_float_array(line.len() as i32) else {
+        return std::ptr::null_mut();
+    };
+    let _ = env.set_float_array_region(&array, 0, &line);
+    array.into_raw()
+}
+
+/// The visualizer's 75 bar heights then their 75 peak caps, 0 to 1.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_bands<'a>(
     env: JNIEnv<'a>,
     _this: JObject<'a>,
 ) -> jni::sys::jfloatArray {
-    let bands = guard(vec![0.0; vis::BANDS], vis::bands);
+    let bands = guard(vec![0.0; 2 * vis::WIDE_BANDS], vis::spectrum);
     let Ok(array) = env.new_float_array(bands.len() as i32) else {
         return std::ptr::null_mut();
     };

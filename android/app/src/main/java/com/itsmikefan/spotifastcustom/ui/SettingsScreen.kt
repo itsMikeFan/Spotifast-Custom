@@ -164,9 +164,30 @@ private fun SoundSection(s: AppSettings, openEffects: () -> Unit) {
     }
 }
 
-/** Visualizer rows; filled in by the visualizer build. */
 @Composable
-private fun VisualizerSection(s: AppSettings, query: String) {}
+private fun VisualizerSection(s: AppSettings, query: String) {
+    if (!matches(query, "Visualizer", "Spectrum", "Waveform", "Colour", "Frame rate", "Long-press")) return
+    var options by remember { mutableStateOf(false) }
+    SectionCard("Visualizer") {
+        SettingRow(
+            "Style and colour",
+            listOf(
+                when (s.playerBarVis) { AppSettings.VIS_WAVEFORM -> "Waveform"; AppSettings.VIS_OFF -> "Off"; else -> "Spectrum" },
+                if (s.playerBarVisColour == null) "colours from album art" else "custom colour",
+            ).joinToString(" · "),
+            onClick = { options = true },
+        ) { s.playerBarVisColour?.let { Box(Modifier.size(20.dp).clip(CircleShape).background(androidx.compose.ui.graphics.Color(it))) } }
+        RowDivider()
+        SettingRow("Frame rate", "${s.visualizerFps} fps", onClick = { Settings.update { it.copy(visualizerFps = if (it.visualizerFps == 60) 30 else 60) } })
+        RowDivider()
+        SwitchRow("Long-press the player bar for visualizer options", null, s.playerBarVisClick) { v -> Settings.update { it.copy(playerBarVisClick = v) } }
+    }
+    if (options) androidx.compose.material3.AlertDialog(
+        onDismissRequest = { options = false },
+        confirmButton = { TextButton(onClick = { options = false }) { Text("Done", color = LocalPalette.current.accent) } },
+        text = { Column(Modifier.verticalScroll(rememberScrollState())) { com.itsmikefan.spotifastcustom.VisualizerOptions() } },
+    )
+}
 
 /** Rows whose words match the settings search stay; a section with none left disappears. */
 fun matches(query: String, vararg words: String) = query.isBlank() || words.any { it.contains(query.trim(), ignoreCase = true) }
