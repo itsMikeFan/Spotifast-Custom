@@ -150,9 +150,13 @@ object Playback {
     /** Connects with [token], or with the saved playback sign-in. Returns why it failed, or null. */
     suspend fun connect(token: String? = null, force: Boolean = false): String? = connecting.withLock {
         if (token == null && !force && state.value.connected) return null
-        withContext(Dispatchers.IO) {
-            Core.connect(out, cacheDir, token, deviceName)
-        }.also { if (it == null) state.value = state.value.copy(connected = true) }
+        // Spotify sometimes drops the first connection mid-handshake; two more tries ride that out.
+        var failed: String? = null
+        for (attempt in 0..2) {
+            if (attempt > 0) kotlinx.coroutines.delay(1500L * attempt)
+            failed = withContext(Dispatchers.IO) { Core.connect(out, cacheDir, token, deviceName) } ?: break
+        }
+        failed.also { if (it == null) state.value = state.value.copy(connected = true) }
     }
 
     /** Plays [track] within [context], starting the background service first. */
