@@ -60,8 +60,9 @@ object Playback {
     private val out by lazy { AudioOut() }
     private lateinit var app: Context
 
-    /** How this phone shows in Spotify Connect. */
-    val deviceName = "Spotifast Custom (${Build.MODEL})"
+    /** How this phone shows in Spotify Connect, as of the last connect. */
+    var deviceName = "Spotifast Custom (${Build.MODEL})"
+        private set
 
     private val cacheDir get() = File(app.filesDir, "librespot").path
     /** librespot keeps a reusable playback sign-in here after the first one. */
@@ -81,6 +82,10 @@ object Playback {
             save = false,
         )
         Core.setVolume(Settings.value.volume)
+        applyPlayerOptions()
+        scope.launch {
+            Settings.state.collect { Core.setTransitions(it.crossfadeSeconds * 1000, it.smoothSkips, it.albumsGapless) }
+        }
         scope.launch {
             while (true) {
                 val next = withContext(Dispatchers.Default) { parse(Core.state()) }
@@ -120,9 +125,29 @@ object Playback {
             .putFloat("mix", e.reverbMix).putFloat("room", e.reverbRoom).apply()
     }
 
+    /** The settings the next connect uses: quality, normalisation, gapless, autoplay and name. */
+    private fun applyPlayerOptions() {
+        val s = Settings.value
+        // Crossfade needs the next song loaded early, which is what gapless does.
+        Core.setPlayerOptions(s.bitrate, s.normalisation, s.gapless || s.crossfadeSeconds > 0, s.autoplay)
+        deviceName = s.deviceName.ifBlank { "Spotifast Custom (${Build.MODEL})" }
+    }
+
+    /** What [restart] would change, to show the Apply button only when needed. */
+    var appliedOptions = options()
+        private set
+
+    fun options() = Settings.value.let { listOf(it.bitrate, it.normalisation, it.gapless || it.crossfadeSeconds > 0, it.autoplay, it.deviceName) }
+
+    /** Reconnects so the playback settings take effect. Playback stops; returns why it failed, or null. */
+    suspend fun restart(): String? {
+        applyPlayerOptions()
+        return connect(force = true).also { if (it == null) appliedOptions = options() }
+    }
+
     /** Connects with [token], or with the saved playback sign-in. Returns why it failed, or null. */
-    suspend fun connect(token: String? = null): String? = connecting.withLock {
-        if (token == null && state.value.connected) return null
+    suspend fun connect(token: String? = null, force: Boolean = false): String? = connecting.withLock {
+        if (token == null && !force && state.value.connected) return null
         withContext(Dispatchers.IO) {
             Core.connect(out, cacheDir, token, deviceName)
         }.also { if (it == null) state.value = state.value.copy(connected = true) }

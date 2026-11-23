@@ -12,6 +12,7 @@ mod effects;
 mod eq;
 #[path = "../../../src/limiter.rs"]
 mod limiter;
+mod output;
 #[path = "../../../src/resample.rs"]
 mod resample;
 mod vis;
@@ -27,7 +28,7 @@ use std::time::Instant;
 
 use jni::JNIEnv;
 use jni::JavaVM;
-use jni::objects::{GlobalRef, JObject, JString, JValue};
+use jni::objects::{GlobalRef, JObject, JString};
 use jni::sys::{jboolean, jfloat, jint, jstring};
 use librespot_connect::{
     ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, PlayingTrack, Spirc,
@@ -37,8 +38,7 @@ use librespot_core::cache::Cache;
 use librespot_core::config::{DeviceType, SessionConfig};
 use librespot_core::session::Session;
 use librespot_metadata::audio::UniqueFields;
-use librespot_playback::SAMPLE_RATE;
-use librespot_playback::audio_backend::{Sink, SinkError, SinkResult};
+use librespot_playback::audio_backend::{Sink, SinkResult};
 use librespot_playback::config::{Bitrate, PlayerConfig};
 use librespot_playback::convert::Converter;
 use librespot_playback::decoder::AudioPacket;
@@ -70,6 +70,8 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static PLAYER: Mutex<Option<std::sync::Arc<Player>>> = Mutex::new(None);
 /// Songs queued from this app that librespot's queue list doesn't show yet:
 /// it only republishes that list on the next playback change.
+/// Bitrate, normalisation, gapless and autoplay, read on each connect.
+static OPTIONS: Mutex<(i32, bool, bool, bool)> = Mutex::new((320, false, true, true));
 static QUEUED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 static EFFECTS: LazyLock<effects::SharedEffects> = LazyLock::new(effects::shared);
@@ -136,29 +138,8 @@ fn rate() -> f64 {
     EFFECTS.lock().map_or(1.0, |s| s.clamped().rate())
 }
 
-/// Writes to the Kotlin `AudioOut`, whose `write` blocks while the
-/// `AudioTrack` is full: that is the decoder's backpressure.
-struct AndroidSink {
-    vm: JavaVM,
-    out: GlobalRef,
-    effects: effects::Processor,
-    limiter: limiter::Limiter,
-    gain: volume::Gain,
-}
-
-impl AndroidSink {
-    fn call(&self, method: &str) -> SinkResult<()> {
-        let mut env = self
-            .vm
-            .attach_current_thread_permanently()
-            .map_err(|e| SinkError::OnWrite(e.to_string()))?;
-        let result = env.call_method(&self.out, method, "()V", &[]);
-        clear_exception(&mut env);
-        result
-            .map(|_| ())
-            .map_err(|e| SinkError::OnWrite(e.to_string()))
-    }
-}
+/// Hands librespot's sound to [output::OUTPUT], which crossfades and plays it.
+struct AndroidSink;
 
 fn clear_exception(env: &mut JNIEnv) {
     if env.exception_check().unwrap_or(false) {
@@ -169,43 +150,32 @@ fn clear_exception(env: &mut JNIEnv) {
 
 impl Sink for AndroidSink {
     fn start(&mut self) -> SinkResult<()> {
-        self.call("start")
+        output::OUTPUT.pause(false);
+        Ok(())
     }
 
     fn stop(&mut self) -> SinkResult<()> {
-        self.call("stop")
+        output::OUTPUT.pause(true);
+        Ok(())
     }
 
-    fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
-        let AudioPacket::Samples(samples) = packet else {
-            return Ok(());
-        };
-        // Same order as the desktop's `vis::Tapped`: effects, then the
-        // limiter, since bass and reverb can push past full scale.
-        let mut samples = self.effects.process(samples);
-        self.limiter.process(&mut samples, 1.0);
-        vis::push(&samples);
-        // After the tap, so the bars don't follow the volume.
-        self.gain.process(&mut samples);
-        let samples = converter.f64_to_f32(&samples);
-        let mut env = self
-            .vm
-            .attach_current_thread_permanently()
-            .map_err(|e| SinkError::OnWrite(e.to_string()))?;
-        // This thread stays attached, so local references must be freed here.
-        let result = env.with_local_frame(4, |env| -> jni::errors::Result<()> {
-            let array = env.new_float_array(samples.len() as i32)?;
-            env.set_float_array_region(&array, 0, &samples)?;
-            env.call_method(
-                &self.out,
-                "write",
-                "([FI)V",
-                &[JValue::Object(&array), JValue::Int(samples.len() as i32)],
-            )?;
-            Ok(())
-        });
-        clear_exception(&mut env);
-        result.map_err(|e| SinkError::OnWrite(e.to_string()))
+    fn write(&mut self, packet: AudioPacket, _converter: &mut Converter) -> SinkResult<()> {
+        if let AudioPacket::Samples(samples) = packet {
+            output::OUTPUT.write(&samples);
+        }
+        Ok(())
+    }
+
+    fn position(&mut self, position_ms: u32, duration_ms: u32) {
+        output::OUTPUT.position(position_ms, duration_ms);
+    }
+
+    fn track_start(&mut self, uri: &str, album: &str, duration_ms: u32, natural: bool) {
+        output::OUTPUT.track_start(uri, album, duration_ms, natural);
+    }
+
+    fn preloaded(&mut self, uri: &str, album: &str, duration_ms: u32) {
+        output::OUTPUT.preloaded(uri, album, duration_ms);
     }
 }
 
@@ -228,6 +198,7 @@ fn connect(
             .credentials()
             .ok_or_else(|| anyhow::anyhow!("not signed in for playback"))?,
     };
+    output::OUTPUT.set_target(vm, out);
     if let Some(old) = SPIRC.lock().unwrap_or_else(|p| p.into_inner()).take() {
         let _ = old.shutdown();
     }
@@ -236,15 +207,23 @@ fn connect(
         // but the playback grant is issued to the desktop client: login5 then
         // refuses it with INVALID_CREDENTIALS. A stable device ID, as on the
         // desktop, keeps the saved credentials and the Connect device the same.
+        let (bitrate, normalisation, gapless, autoplay) = *OPTIONS.lock().unwrap_or_else(|p| p.into_inner());
         let session_config = SessionConfig {
             client_id: PLAYBACK_CLIENT_ID.to_string(),
             device_id: device_id(&device_name),
+            autoplay: Some(autoplay),
             ..SessionConfig::default()
         };
         let session = Session::new(session_config, Some(cache));
         let mixer: std::sync::Arc<dyn Mixer> = std::sync::Arc::new(volume::AppMixer);
         let player_config = PlayerConfig {
-            bitrate: Bitrate::Bitrate320,
+            bitrate: match bitrate {
+                96 => Bitrate::Bitrate96,
+                160 => Bitrate::Bitrate160,
+                _ => Bitrate::Bitrate320,
+            },
+            normalisation,
+            gapless,
             position_update_interval: Some(std::time::Duration::from_secs(1)),
             ..PlayerConfig::default()
         };
@@ -252,15 +231,7 @@ fn connect(
             player_config,
             session.clone(),
             mixer.get_soft_volume(),
-            move || {
-                Box::new(AndroidSink {
-                    vm,
-                    out,
-                    effects: effects::Processor::new(EFFECTS.clone()),
-                    limiter: limiter::Limiter::new(f64::from(SAMPLE_RATE)),
-                    gain: volume::Gain::new(f64::from(SAMPLE_RATE)),
-                })
-            },
+            || Box::new(AndroidSink),
         );
         tokio::spawn(follow(player.get_player_event_channel()));
         *PLAYER.lock().unwrap_or_else(|p| p.into_inner()) = Some(player.clone());
@@ -289,6 +260,13 @@ fn connect(
 
 async fn follow(mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>) {
     while let Some(event) = events.recv().await {
+        if matches!(event, PlayerEvent::TrackChanged { .. }) {
+            // Keep the old title until the crossfade's midpoint.
+            let hold = output::HOLD_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if hold > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(hold)).await;
+            }
+        }
         let mut state = state();
         match event {
             PlayerEvent::TrackChanged { audio_item } => {
@@ -521,6 +499,35 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_setVolume(
             let _ = spirc.set_volume(value);
         }
     });
+}
+
+/// Crossfade length (0 for plain gapless), fades on skips, and whether
+/// songs of one album stay seamless.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_setTransitions(
+    _env: JNIEnv,
+    _this: JObject,
+    crossfade_ms: jint,
+    smooth_skips: jboolean,
+    albums_gapless: jboolean,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    output::CROSSFADE_MS.store(crossfade_ms.clamp(0, 12_000) as u32, Relaxed);
+    output::SMOOTH_SKIPS.store(smooth_skips != 0, Relaxed);
+    output::ALBUMS_GAPLESS.store(albums_gapless != 0, Relaxed);
+}
+
+/// Takes effect on the next connect.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_setPlayerOptions(
+    _env: JNIEnv,
+    _this: JObject,
+    bitrate: jint,
+    normalisation: jboolean,
+    gapless: jboolean,
+    autoplay: jboolean,
+) {
+    *OPTIONS.lock().unwrap_or_else(|p| p.into_inner()) = (bitrate, normalisation != 0, gapless != 0, autoplay != 0);
 }
 
 #[unsafe(no_mangle)]

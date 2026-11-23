@@ -3,6 +3,7 @@ package com.itsmikefan.spotifastcustom
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
+import android.media.VolumeShaper
 import androidx.annotation.Keep
 
 /** The Rust core (android/core): librespot, Spotify Connect and the effects. */
@@ -36,6 +37,12 @@ object Core {
 
     /** The app's volume, 0 to 100, applied after the visualizer; Spotify Connect hears of it too. */
     external fun setVolume(percent: Int)
+
+    /** Crossfade length in ms (0 for plain gapless), fades on skips, seamless albums. Live. */
+    external fun setTransitions(crossfadeMs: Int, smoothSkips: Boolean, albumsGapless: Boolean)
+
+    /** Used on the next [connect]. */
+    external fun setPlayerOptions(bitrate: Int, normalisation: Boolean, gapless: Boolean, autoplay: Boolean)
 
     external fun setEffects(on: Boolean, ratePercent: Int, bassDb: Float, reverbMix: Float, reverbRoom: Float)
 
@@ -85,9 +92,40 @@ class AudioOut {
         track.pause()
     }
 
+    /** The last skip's fade-out, played backwards as the next sound's fade-in. */
+    private var shaper: VolumeShaper? = null
+    /** One already played backwards; kept until the next skip so its volume holds at full. */
+    private var spent: VolumeShaper? = null
+
+    /** Drops what the speaker still holds of the old song, after a short fade when [fade]. */
+    @Keep
+    fun skip(fade: Boolean) {
+        if (fade && track.playState == AudioTrack.PLAYSTATE_PLAYING) runCatching {
+            spent?.close()
+            spent = null
+            shaper = track.createVolumeShaper(FADE).also { it.apply(VolumeShaper.Operation.PLAY) }
+            Thread.sleep(FADE_MS)
+        }
+        track.pause()
+        track.flush()
+    }
+
     @Keep
     fun write(samples: FloatArray, count: Int) {
-        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) track.play()
+        if (track.playState != AudioTrack.PLAYSTATE_PLAYING) {
+            track.play()
+            shaper?.let { s -> runCatching { s.apply(VolumeShaper.Operation.REVERSE) }; spent = s }
+            shaper = null
+        }
         track.write(samples, 0, count, AudioTrack.WRITE_BLOCKING)
+    }
+
+    private companion object {
+        const val FADE_MS = 120L
+        val FADE: VolumeShaper.Configuration = VolumeShaper.Configuration.Builder()
+            .setDuration(FADE_MS)
+            .setCurve(floatArrayOf(0f, 1f), floatArrayOf(1f, 0f))
+            .setInterpolatorType(VolumeShaper.Configuration.INTERPOLATOR_TYPE_CUBIC)
+            .build()
     }
 }

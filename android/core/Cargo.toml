@@ -55,7 +55,7 @@ librespot-connect = { git = "https://github.com/crmne/librespot", rev = "3ba977f
 librespot-core = { path = "vendor/librespot-core" }
 librespot-metadata = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
 librespot-oauth = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
-librespot-playback = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
+librespot-playback = { path = "vendor/librespot-playback" }
 librespot-protocol = { git = "https://github.com/crmne/librespot", rev = "3ba977f1f918582edce566cfc16617f8eccdfb1e" }
 
 [profile.release]
@@ -67,3 +67,4 @@ strip = true
 # git checkout; point those at the vendored copy too, so one copy exists.
 [patch."https://github.com/crmne/librespot"]
 librespot-core = { path = "vendor/librespot-core" }
+librespot-playback = { path = "vendor/librespot-playback" }

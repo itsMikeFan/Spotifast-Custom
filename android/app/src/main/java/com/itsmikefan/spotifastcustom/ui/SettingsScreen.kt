@@ -133,9 +133,54 @@ fun SettingsScreen(openEffects: () -> Unit, signOut: () -> Unit, offerUpdate: (U
     importError?.let { AlertDialog(onDismissRequest = { importError = null }, confirmButton = { TextButton(onClick = { importError = null }) { Text("OK") } }, text = { Text(it) }) }
 }
 
-/** Playback rows; filled in by the crossfade and volume builds. */
 @Composable
-private fun PlaybackSection(s: AppSettings, query: String) {}
+private fun PlaybackSection(s: AppSettings, query: String) {
+    if (!matches(query, "Playback", "Crossfade", "Smooth skips", "Albums", "Gapless", "Normalise", "Quality", "Autoplay", "Device name")) return
+    val p = LocalPalette.current
+    val scope = rememberCoroutineScope()
+    var restarting by remember { mutableStateOf(false) }
+    var restartError by remember { mutableStateOf<String?>(null) }
+    SectionCard("Playback") {
+        val fade = s.crossfadeSeconds
+        SettingRow("Crossfade", if (fade == 0) "Off: songs play back to back" else "Each song blends into the next over $fade s") {
+            Text(if (fade == 0) "Off" else "$fade s", fontSize = 13.sp, color = p.secondary)
+        }
+        androidx.compose.material3.Slider(
+            fade.toFloat(), { v -> Settings.update { it.copy(crossfadeSeconds = Math.round(v)) } },
+            valueRange = 0f..12f, steps = 11, modifier = Modifier.padding(horizontal = 16.dp),
+            colors = androidx.compose.material3.SliderDefaults.colors(thumbColor = p.accent, activeTrackColor = p.accent, inactiveTrackColor = p.surfaceActive),
+        )
+        RowDivider()
+        SwitchRow("Smooth skips", "A short fade instead of a hard cut when you skip, pick a song or seek", s.smoothSkips) { v -> Settings.update { it.copy(smoothSkips = v) } }
+        RowDivider()
+        SwitchRow("Don't crossfade albums", "Songs of the same album stay seamless, for live and mixed albums", s.albumsGapless, enabled = fade > 0) { v -> Settings.update { it.copy(albumsGapless = v) } }
+        RowDivider()
+        SwitchRow("Gapless", if (fade > 0) "Always on while crossfading" else "No silence between songs", s.gapless || fade > 0, enabled = fade == 0) { v -> Settings.update { it.copy(gapless = v) } }
+        RowDivider()
+        SwitchRow("Normalise volume", "Songs play at a similar loudness", s.normalisation) { v -> Settings.update { it.copy(normalisation = v) } }
+        RowDivider()
+        SettingRow("Quality", "Streaming bitrate in kbit/s")
+        Row(Modifier.padding(start = 16.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (b in listOf(96, 160, 320)) Chip("$b", s.bitrate == b) { Settings.update { it.copy(bitrate = b) } }
+        }
+        RowDivider()
+        SwitchRow("Autoplay", "Keep playing similar songs when a playlist ends", s.autoplay) { v -> Settings.update { it.copy(autoplay = v) } }
+        RowDivider()
+        SettingRow("Device name", "How this phone shows in Spotify Connect")
+        OutlinedTextField(
+            s.deviceName, { v -> Settings.update { it.copy(deviceName = v.take(60)) } }, singleLine = true,
+            modifier = Modifier.fillMaxWidth().padding(start = 16.dp, end = 16.dp, bottom = 8.dp),
+        )
+        if (Playback.options() != Playback.appliedOptions) {
+            RowDivider()
+            SettingRow("Some changes need a restart", restartError ?: "Playback stops; press play again afterwards.")
+            PillButton(if (restarting) "Restarting…" else "Apply and restart playback", enabled = !restarting, modifier = Modifier.padding(start = 16.dp, bottom = 12.dp)) {
+                restarting = true
+                scope.launch { restartError = Playback.restart(); restarting = false }
+            }
+        }
+    }
+}
 
 @Composable
 private fun SoundSection(s: AppSettings, openEffects: () -> Unit) {
