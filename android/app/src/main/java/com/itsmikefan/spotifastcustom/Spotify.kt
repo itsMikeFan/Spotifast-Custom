@@ -200,6 +200,7 @@ object Spotify {
             ?.toRequestBody("application/json".toMediaType())
         var refreshed = false
         var waited = false
+        var serverErrors = 0
         while (true) {
             val request = okhttp3.Request.Builder().url(url)
                 .header("Authorization", "Bearer ${accessToken(refreshed)}")
@@ -210,6 +211,11 @@ object Spotify {
                 when {
                     response.isSuccessful -> return@withContext text.takeIf { it.isNotBlank() }?.let { attempt { JSONObject(it) }.getOrNull() }
                     response.code == 401 && !refreshed -> refreshed = true
+                    // Spotify's 502/503s pass within a second or two.
+                    response.code >= 500 && serverErrors < 2 -> {
+                        serverErrors++
+                        Thread.sleep(1000L * serverErrors)
+                    }
                     response.code == 429 && !waited -> {
                         waited = true
                         Thread.sleep((response.header("Retry-After")?.toLongOrNull() ?: 2).coerceAtMost(30) * 1000)
