@@ -23,6 +23,9 @@ object Core {
     /** Adds a song to Spotify's queue, after the current one. */
     external fun queue(uri: String)
 
+    /** Plays [uri] from Up next now, dropping the songs before it. */
+    external fun skipTo(uri: String)
+
     /** [count] songs of a playlist from [offset], read through the playback session, as Web API-shaped JSON or {"error": ...}. */
     external fun playlistPage(uri: String, offset: Int, count: Int): String
 

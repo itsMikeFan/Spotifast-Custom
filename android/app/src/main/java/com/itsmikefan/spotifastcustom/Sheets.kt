@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CheckboxDefaults
@@ -79,7 +80,7 @@ fun ShowSheet(sheet: Sheet, nav: Nav, close: () -> Unit) {
                 is Sheet.Song -> SongSheet(sheet.track, nav, close)
                 is Sheet.AddTo -> AddToPlaylist(sheet.track, nav, close)
                 is Sheet.Duplicates -> FindDuplicates(sheet.playlist, sheet.tracks, nav, close, sheet.changed)
-                is Sheet.UpNext -> UpNext(sheet.uris)
+                is Sheet.UpNext -> UpNext(sheet.uris, nav, close)
                 Sheet.Devices -> Devices(close)
                 Sheet.Effects -> EffectsSheet()
                 Sheet.Visualizer -> VisualizerSheet()
@@ -238,18 +239,19 @@ private fun FindDuplicates(playlist: Playlist, tracks: List<Track>, nav: Nav, cl
 
 /** The song playing, then the songs after it, named even when they came from Spotify's own queue. */
 @Composable
-private fun UpNext(uris: List<String>) {
+private fun UpNext(uris: List<String>, nav: Nav, close: () -> Unit) {
     val p = LocalPalette.current
     val state by Playback.state.collectAsState()
     SheetTitle("Up next")
     LazyColumn(Modifier.fillMaxWidth().heightIn(max = 520.dp)) {
         if (state.uri.isNotEmpty() && !Playback.remoteActive) {
             item { Label("Now playing") }
-            item { QueueRow(state.uri, current = true) }
+            item { QueueRow(state.uri, current = true) {} }
         }
         item { Label("Next") }
         if (uris.isEmpty()) item { Text("Nothing after this song.", color = p.secondary, modifier = Modifier.padding(horizontal = 20.dp, vertical = 8.dp)) }
-        items(uris) { QueueRow(it, current = false) }
+        // Tapping a song plays it now.
+        itemsIndexed(uris) { i, uri -> QueueRow(uri, current = false) { Playback.skipTo(uri, i, nav.error); close() } }
     }
 }
 
@@ -259,13 +261,13 @@ private fun Label(text: String) {
 }
 
 @Composable
-private fun QueueRow(uri: String, current: Boolean) {
+private fun QueueRow(uri: String, current: Boolean, onClick: () -> Unit) {
     val p = LocalPalette.current
     var t by remember(uri) { mutableStateOf(Spotify.known[uri]) }
     // Songs queued in the Spotify app come over as bare URIs.
     var looked by remember(uri) { mutableStateOf(false) }
     if (t == null) LaunchedEffect(uri) { t = Spotify.lookup(uri); looked = true }
-    Row(Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().clickable(enabled = !current, onClick = onClick).padding(horizontal = 20.dp, vertical = 5.dp), verticalAlignment = Alignment.CenterVertically) {
         Cover(t?.cover, 40.dp)
         Column(Modifier.weight(1f).padding(start = 12.dp)) {
             Text(t?.name ?: if (looked) uri else "…", maxLines = 1, overflow = TextOverflow.Ellipsis, color = if (current) p.accent else p.text)

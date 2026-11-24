@@ -550,6 +550,32 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_playlistPage<'a>
     env.new_string(json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
+/// Plays [uri] from Up next now: the songs before it come off the list, as in
+/// Spotify's own queue, so only one song loads.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_skipTo<'a>(
+    mut env: JNIEnv<'a>,
+    _this: JObject<'a>,
+    uri: JString<'a>,
+) {
+    let Some(uri) = string(&mut env, &uri) else {
+        return;
+    };
+    guard((), || {
+        spirc(|spirc| {
+            let next = spirc.watch_queue_list().borrow().next_tracks.clone();
+            // A song queued here that librespot doesn't list yet is first in line already.
+            for before in next.iter().take_while(|u| **u != uri) {
+                if next.contains(&uri) {
+                    spirc.remove_next_track(0, librespot_core::SpotifyUri::from_uri(before)?)?;
+                }
+            }
+            QUEUED.lock().unwrap_or_else(|p| p.into_inner()).retain(|u| *u != uri);
+            spirc.next()
+        })
+    });
+}
+
 /// Adds a song to Spotify's queue: it plays after the current song.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_queue<'a>(

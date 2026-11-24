@@ -189,6 +189,19 @@ object Playback {
     }
 
     /** Sends a command, reconnecting first if the session dropped. */
+    /** Jumps to [uri] in Up next: on the phone directly, on another device by skipping [index] + 1 times. */
+    fun skipTo(uri: String, index: Int, onError: (String) -> Unit) {
+        scope.launch {
+            if (remoteActive && !state.value.playing) {
+                // The Web API has no "play this queue item"; skipping is all it offers.
+                attempt { repeat(index + 1) { Spotify.remoteCommand(Core.NEXT) } }.onFailure { onError("Could not skip: ${it.message}") }
+                return@launch
+            }
+            connect()?.let { onError(it); return@launch }
+            withContext(Dispatchers.IO) { Core.skipTo(uri) }
+        }
+    }
+
     fun command(command: Int, value: Int = 0) {
         scope.launch {
             if (connect() != null) return@launch
