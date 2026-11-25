@@ -195,12 +195,23 @@ object Playback {
     }
 
     /** Sends a command, reconnecting first if the session dropped. */
-    /** Jumps to [uri] in Up next: on the phone directly, on another device by skipping [index] + 1 times. */
+    /** What plays on another device, as the library's poll last saw it. */
+    @Volatile var remote: Remote? = null
+
+    /** Jumps to [uri] in Up next in one step, here or on the device that plays. */
     fun skipTo(uri: String, index: Int, onError: (String) -> Unit) {
         scope.launch {
-            if (remoteActive && !state.value.playing) {
-                // The Web API has no "play this queue item"; skipping is all it offers.
-                attempt { repeat(index + 1) { Spotify.remoteCommand(Core.NEXT) } }.onFailure { onError("Could not skip: ${it.message}") }
+            val r = remote
+            if (remoteActive && !state.value.playing && r != null) {
+                // Spotify Connect's "skip to this song", over this phone's session: the songs before it never load.
+                val direct = r.deviceId.isNotEmpty() && connect() == null &&
+                    withContext(Dispatchers.IO) { Core.remoteSkipTo(r.deviceId, uri) } == null
+                if (direct) return@launch
+                // The Web API can jump within the playing playlist; a song queued outside it needs the skips.
+                attempt {
+                    if (r.context.isNotEmpty() && attempt { Spotify.playInContext(r.context, uri) }.isSuccess) return@attempt
+                    repeat(index + 1) { Spotify.remoteCommand(Core.NEXT) }
+                }.onFailure { onError("Could not skip: ${it.message}") }
                 return@launch
             }
             connect()?.let { onError(it); return@launch }

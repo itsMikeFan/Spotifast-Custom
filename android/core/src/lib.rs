@@ -582,17 +582,51 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_skipTo<'a>(
     log::info!("timing: skip to {uri}");
     guard((), || {
         spirc(|spirc| {
-            let next = spirc.watch_queue_list().borrow().next_tracks.clone();
-            // A song queued here that librespot doesn't list yet is first in line already.
-            for before in next.iter().take_while(|u| **u != uri) {
-                if next.contains(&uri) {
-                    spirc.remove_next_track(0, librespot_core::SpotifyUri::from_uri(before)?)?;
-                }
-            }
+            let listed = spirc.watch_queue_list().borrow().next_tracks.contains(&uri);
             QUEUED.lock().unwrap_or_else(|p| p.into_inner()).retain(|u| *u != uri);
-            spirc.next()
+            // One jump: the songs before it come off the list without loading.
+            // A song queued here that librespot doesn't list yet is first in line already.
+            if listed { spirc.skip_to(uri) } else { spirc.next() }
         })
     });
+}
+
+/// Plays `uri` from the queue of another Connect device (`device`) in one
+/// step, as Spotify's own apps do, instead of one skip per song before it.
+/// Returns why it failed, or null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_remoteSkipTo<'a>(
+    mut env: JNIEnv<'a>,
+    _this: JObject<'a>,
+    device: JString<'a>,
+    uri: JString<'a>,
+) -> jstring {
+    let (Some(device), Some(uri)) = (string(&mut env, &device), string(&mut env, &uri)) else {
+        return std::ptr::null_mut();
+    };
+    log::info!("timing: remote skip to {uri} on {device}");
+    let error = guard(Some("native panic".to_string()), || {
+        let Some(session) = SESSION.lock().unwrap_or_else(|p| p.into_inner()).clone() else {
+            return Some("not connected".into());
+        };
+        let body = serde_json::json!({ "command": {
+            "endpoint": "skip_next",
+            "track": { "uri": uri },
+            "logging_params": {},
+        }});
+        let path = format!("/connect-state/v1/player/command/from/{}/to/{device}", session.device_id());
+        RUNTIME
+            .block_on(session.spclient().request(&reqwest::Method::POST, &path, None, Some(body.to_string().as_bytes())))
+            .err()
+            .map(|e| e.to_string())
+    });
+    match error {
+        None => JObject::null().into_raw(),
+        Some(error) => {
+            log::warn!("remote skip failed: {error}");
+            env.new_string(error).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }
+    }
 }
 
 /// Adds a song to Spotify's queue: it plays after the current song.

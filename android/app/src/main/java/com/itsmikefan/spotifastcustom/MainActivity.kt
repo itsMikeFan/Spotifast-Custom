@@ -111,6 +111,7 @@ private fun Main(offer: (Updates.Update) -> Unit, signOut: () -> Unit) {
             remote = if (Playback.state.value.playing) null
             else attempt { Spotify.remote() }.getOrNull()?.takeIf { it.device != Playback.deviceName }
             Playback.remoteActive = remote != null
+            Playback.remote = remote
             kotlinx.coroutines.delay(3000)
         }
     }

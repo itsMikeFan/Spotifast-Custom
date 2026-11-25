@@ -39,6 +39,8 @@ data class Device(val id: String, val name: String, val type: String, val active
 data class Remote(
     val device: String, val playing: Boolean, val name: String, val artists: String, val cover: String?,
     val volume: Int = -1, val canSetVolume: Boolean = true, val uri: String = "",
+    /** The device's Connect ID and the playlist or album playing, for jumps within it. */
+    val deviceId: String = "", val context: String = "",
 )
 
 /**
@@ -406,6 +408,7 @@ object Spotify {
             device?.optString("name") ?: "", o.optBoolean("is_playing"), item.optString("name"), artists,
             image(item.optJSONObject("album")?.optJSONArray("images")),
             device?.optInt("volume_percent", -1) ?: -1, device?.optBoolean("supports_volume", true) ?: true, item.optString("uri"),
+            device?.optString("id") ?: "", o.optJSONObject("context")?.optString("uri") ?: "",
         )
     }
 
@@ -414,6 +417,11 @@ object Spotify {
         val tracks = get("/search?type=track&limit=10&offset=$offset&market=from_token&q=${enc(query)}")
             .optJSONObject("tracks")?.optJSONArray("items") ?: return emptyList()
         return (0 until tracks.length()).mapNotNull { tracks.optJSONObject(it)?.let(::song) }
+    }
+
+    /** Plays [uri] within [context] on whichever device is active, in one call. */
+    suspend fun playInContext(context: String, uri: String) {
+        call("PUT", "/me/player/play", JSONObject().put("context_uri", context).put("offset", JSONObject().put("uri", uri)))
     }
 
     /** Adds [uri] to the queue of whichever device is active. */
