@@ -171,6 +171,11 @@ private fun PlaybackSection(s: AppSettings, query: String) {
             for (b in listOf(96, 160, 320)) Chip("$b", s.bitrate == b) { Settings.update { it.copy(bitrate = b) } }
         }
         RowDivider()
+        SettingRow("Song cache", "Songs you replay start from the phone instead of downloading again (MB)")
+        Row(Modifier.padding(start = 16.dp, bottom = 8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            for (mb in listOf(0, 256, 512, 1024, 2048)) Chip(if (mb == 0) "Off" else "$mb", s.songCacheMb == mb) { Settings.update { it.copy(songCacheMb = mb) } }
+        }
+        RowDivider()
         SwitchRow("Autoplay", "Keep playing similar songs when a playlist ends", s.autoplay) { v -> Settings.update { it.copy(autoplay = v) } }
         RowDivider()
         SettingRow("Device name", "How this phone shows in Spotify Connect")

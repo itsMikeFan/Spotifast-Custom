@@ -30,6 +30,8 @@ data class AppSettings(
     val normalisation: Boolean = false,
     val bitrate: Int = 320,
     val autoplay: Boolean = true,
+    /** Songs kept on the phone so replays start from storage; 0 is off. */
+    val songCacheMb: Int = 512,
     val deviceName: String = "Spotifast Custom (${Build.MODEL})",
     // Sound
     val volume: Int = 100,
@@ -73,6 +75,7 @@ object Settings {
                 normalisation = getBoolean("normalisation", d.normalisation),
                 bitrate = getInt("bitrate", d.bitrate),
                 autoplay = getBoolean("autoplay", d.autoplay),
+                songCacheMb = getInt("song_cache_mb", d.songCacheMb),
                 deviceName = getString("device_name", d.deviceName)!!,
                 volume = getInt("volume", d.volume),
                 volumeKeysApp = getBoolean("volume_keys_app", d.volumeKeysApp),
@@ -98,6 +101,7 @@ object Settings {
             .putInt("crossfade_seconds", s.crossfadeSeconds).putBoolean("smooth_skips", s.smoothSkips)
             .putBoolean("albums_gapless", s.albumsGapless).putBoolean("gapless", s.gapless)
             .putBoolean("normalisation", s.normalisation).putInt("bitrate", s.bitrate).putBoolean("autoplay", s.autoplay)
+            .putInt("song_cache_mb", s.songCacheMb)
             .putString("device_name", s.deviceName).putInt("volume", s.volume).putBoolean("volume_keys_app", s.volumeKeysApp)
             .putBoolean("check_for_updates", s.checkForUpdates)
             .putString("search_history", JSONArray(s.searchHistory).toString())

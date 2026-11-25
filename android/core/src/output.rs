@@ -225,6 +225,9 @@ impl Output {
             // After the tap, so the bars don't follow the volume.
             gain.process(&mut samples);
             let floats: Vec<f32> = samples.iter().map(|s| *s as f32).collect();
+            if java_paused {
+                log::info!("timing: first sound out");
+            }
             self.write_java(&floats);
             java_paused = false;
         }

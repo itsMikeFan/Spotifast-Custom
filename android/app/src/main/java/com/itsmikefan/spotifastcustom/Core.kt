@@ -51,7 +51,7 @@ object Core {
     external fun setTransitions(crossfadeMs: Int, smoothSkips: Boolean, albumsGapless: Boolean)
 
     /** Used on the next [connect]. */
-    external fun setPlayerOptions(bitrate: Int, normalisation: Boolean, gapless: Boolean, autoplay: Boolean)
+    external fun setPlayerOptions(bitrate: Int, normalisation: Boolean, gapless: Boolean, autoplay: Boolean, cacheMb: Int)
 
     external fun setEffects(on: Boolean, ratePercent: Int, bassDb: Float, reverbMix: Float, reverbRoom: Float)
 

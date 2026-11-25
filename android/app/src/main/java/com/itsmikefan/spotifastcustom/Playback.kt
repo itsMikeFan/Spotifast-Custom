@@ -85,6 +85,7 @@ object Playback {
         )
         Core.setVolume(Settings.value.volume)
         applyPlayerOptions()
+        warm()
         scope.launch {
             Settings.state.collect { Core.setTransitions(it.crossfadeSeconds * 1000, it.smoothSkips, it.albumsGapless) }
         }
@@ -131,7 +132,7 @@ object Playback {
     private fun applyPlayerOptions() {
         val s = Settings.value
         // Crossfade needs the next song loaded early, which is what gapless does.
-        Core.setPlayerOptions(s.bitrate, s.normalisation, s.gapless || s.crossfadeSeconds > 0, s.autoplay)
+        Core.setPlayerOptions(s.bitrate, s.normalisation, s.gapless || s.crossfadeSeconds > 0, s.autoplay, s.songCacheMb)
         deviceName = s.deviceName.ifBlank { "Spotifast Custom (${Build.MODEL})" }
     }
 
@@ -139,7 +140,7 @@ object Playback {
     var appliedOptions = options()
         private set
 
-    fun options() = Settings.value.let { listOf(it.bitrate, it.normalisation, it.gapless || it.crossfadeSeconds > 0, it.autoplay, it.deviceName) }
+    fun options() = Settings.value.let { listOf(it.bitrate, it.normalisation, it.gapless || it.crossfadeSeconds > 0, it.autoplay, it.songCacheMb, it.deviceName) }
 
     /** Reconnects so the playback settings take effect. Playback stops; returns why it failed, or null. */
     suspend fun restart(): String? {
@@ -159,11 +160,16 @@ object Playback {
         failed.also { if (it == null) state.value = state.value.copy(connected = true) }
     }
 
+    /** Opens the playback session ahead of the first song, so a tap doesn't wait for sign-in. */
+    fun warm() {
+        if (hasPlaybackSignIn && !state.value.connected) scope.launch { connect() }
+    }
+
     /** Plays [track] within [context], starting the background service first. */
     fun play(context: String, track: String?, onError: (String) -> Unit) = load(context, track, -1, onError)
 
-    /** Plays a whole playlist from the top, or shuffled. */
-    fun playShuffled(context: String, shuffle: Boolean, onError: (String) -> Unit) = load(context, null, if (shuffle) 1 else 0, onError)
+    /** Plays a whole playlist from the top, or shuffled, starting with [first] when the caller knows it. */
+    fun playShuffled(context: String, shuffle: Boolean, onError: (String) -> Unit, first: String? = null) = load(context, first, if (shuffle) 1 else 0, onError)
 
     private fun load(context: String, track: String?, shuffle: Int, onError: (String) -> Unit) {
         ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))

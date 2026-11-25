@@ -104,7 +104,12 @@ fun PlaylistScreen(playlist: Playlist, nav: Nav, back: () -> Unit, onPublic: (Bo
                 Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp),
             ) {
-                PlayCircle(playing = false, size = 52.dp) { Playback.playShuffled(playlist.uri, shuffle, nav.error) }
+                PlayCircle(playing = false, size = 52.dp) {
+                    // Naming the first song lets it download while the playlist resolves.
+                    // shortcut: picks from the songs loaded so far, which favours early pages while a big playlist still loads.
+                    val playable = list.orEmpty().filter { it.playable }
+                    Playback.playShuffled(playlist.uri, shuffle, nav.error, (if (shuffle) playable.randomOrNull() else playable.firstOrNull())?.uri)
+                }
                 IconBtn(Icons.Shuffle, if (shuffle) "Shuffle on" else "Shuffle off", 24.dp, on = shuffle) { shuffle = !shuffle }
                 if (playlist.owned) IconBtn(Icons.CopyX, "Find duplicates", 22.dp, enabled = complete && list != null) {
                     list?.let { nav.sheet(Sheet.Duplicates(playlist, it) { reload++ }) }

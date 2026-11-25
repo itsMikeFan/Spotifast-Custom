@@ -70,8 +70,8 @@ static SESSION: Mutex<Option<Session>> = Mutex::new(None);
 static PLAYER: Mutex<Option<std::sync::Arc<Player>>> = Mutex::new(None);
 /// Songs queued from this app that librespot's queue list doesn't show yet:
 /// it only republishes that list on the next playback change.
-/// Bitrate, normalisation, gapless and autoplay, read on each connect.
-static OPTIONS: Mutex<(i32, bool, bool, bool)> = Mutex::new((320, false, true, true));
+/// Bitrate, normalisation, gapless, autoplay and song cache size in MB, read on each connect.
+static OPTIONS: Mutex<(i32, bool, bool, bool, i32)> = Mutex::new((320, false, true, true, 512));
 static QUEUED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 static EFFECTS: LazyLock<effects::SharedEffects> = LazyLock::new(effects::shared);
@@ -194,7 +194,15 @@ fn connect(
     // shortcut: librespot keeps the reusable credentials as a file in the
     // app's private storage, not in Android Keystore; move them there if the
     // phone may be rooted or shared.
-    let cache = Cache::new(Some(&cache_dir), Some(&cache_dir), None, None)?;
+    let cache_mb = OPTIONS.lock().unwrap_or_else(|p| p.into_inner()).4;
+    // Replays start from storage, as on the desktop; librespot trims it to the limit.
+    let audio_dir = format!("{cache_dir}/audio");
+    let cache = Cache::new(
+        Some(&cache_dir),
+        Some(&cache_dir),
+        (cache_mb > 0).then_some(&audio_dir),
+        (cache_mb > 0).then(|| cache_mb as u64 * 1024 * 1024),
+    )?;
     let credentials = match token {
         Some(token) => Credentials::with_access_token(token),
         None => cache
@@ -202,6 +210,7 @@ fn connect(
             .ok_or_else(|| anyhow::anyhow!("not signed in for playback"))?,
     };
     output::OUTPUT.set_target(vm, out);
+    log::info!("timing: connect start");
     if let Some(old) = SPIRC.lock().unwrap_or_else(|p| p.into_inner()).take() {
         let _ = old.shutdown();
     }
@@ -210,7 +219,7 @@ fn connect(
         // but the playback grant is issued to the desktop client: login5 then
         // refuses it with INVALID_CREDENTIALS. A stable device ID, as on the
         // desktop, keeps the saved credentials and the Connect device the same.
-        let (bitrate, normalisation, gapless, autoplay) = *OPTIONS.lock().unwrap_or_else(|p| p.into_inner());
+        let (bitrate, normalisation, gapless, autoplay, _) = *OPTIONS.lock().unwrap_or_else(|p| p.into_inner());
         let session_config = SessionConfig {
             client_id: PLAYBACK_CLIENT_ID.to_string(),
             device_id: device_id(&device_name),
@@ -251,6 +260,7 @@ fn connect(
         *SESSION.lock().unwrap_or_else(|p| p.into_inner()) = Some(session);
         *SPIRC.lock().unwrap_or_else(|p| p.into_inner()) = Some(spirc);
         state().connected = true;
+        log::info!("timing: connect done");
         tokio::spawn(async move {
             task.await;
             let mut state = state();
@@ -263,6 +273,11 @@ fn connect(
 
 async fn follow(mut events: tokio::sync::mpsc::UnboundedReceiver<PlayerEvent>) {
     while let Some(event) = events.recv().await {
+        match &event {
+            PlayerEvent::Loading { track_id, .. } => log::info!("timing: player loading {track_id:?}"),
+            PlayerEvent::Playing { track_id, .. } => log::info!("timing: player playing {track_id:?}"),
+            _ => {}
+        }
         if matches!(event, PlayerEvent::TrackChanged { .. }) {
             // Keep the old title until the crossfade's midpoint.
             let hold = output::HOLD_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
@@ -355,10 +370,12 @@ impl log::Log for Logger {
             if lines.len() >= 1500 {
                 lines.pop_front();
             }
-            let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() % 86_400);
+            // Milliseconds, so the log shows where a slow start spent its time.
+            let ms = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() % 86_400_000);
+            let secs = ms / 1000;
             lines.push_back(format!(
-                "{:02}:{:02}:{:02} {} {}: {}",
-                secs / 3600, secs / 60 % 60, secs % 60, record.level(), record.target(), record.args()
+                "{:02}:{:02}:{:02}.{:03} {} {}: {}",
+                secs / 3600, secs / 60 % 60, secs % 60, ms % 1000, record.level(), record.target(), record.args()
             ));
         }
         // Only a refused audio key stops a song for good; librespot's other
@@ -451,6 +468,7 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_load<'a>(
         return;
     };
     let track = string(&mut env, &track);
+    log::info!("timing: load {context} from {track:?}");
     guard((), || {
         // As on the desktop: librespot resolves the whole playlist before it
         // fetches the song, so fetch the song now and the load picks it up.
@@ -561,6 +579,7 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_skipTo<'a>(
     let Some(uri) = string(&mut env, &uri) else {
         return;
     };
+    log::info!("timing: skip to {uri}");
     guard((), || {
         spirc(|spirc| {
             let next = spirc.watch_queue_list().borrow().next_tracks.clone();
@@ -629,6 +648,7 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_command(
     command: jint,
     value: jint,
 ) {
+    log::info!("timing: command {command}");
     guard((), || {
         spirc(|spirc| match command {
             0 => spirc.play(),
@@ -688,8 +708,9 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_setPlayerOptions
     normalisation: jboolean,
     gapless: jboolean,
     autoplay: jboolean,
+    cache_mb: jint,
 ) {
-    *OPTIONS.lock().unwrap_or_else(|p| p.into_inner()) = (bitrate, normalisation != 0, gapless != 0, autoplay != 0);
+    *OPTIONS.lock().unwrap_or_else(|p| p.into_inner()) = (bitrate, normalisation != 0, gapless != 0, autoplay != 0, cache_mb);
 }
 
 #[unsafe(no_mangle)]
