@@ -26,6 +26,9 @@ object Core {
     /** Plays [uri] from Up next now, dropping the songs before it. */
     external fun skipTo(uri: String)
 
+    /** False once the playback session has dropped, even before the state says so. */
+    external fun alive(): Boolean
+
     /** Plays [uri] from the queue of the Connect device [device] in one step; returns why it failed, or null. */
     external fun remoteSkipTo(device: String, uri: String): String?
 

@@ -150,7 +150,8 @@ object Playback {
 
     /** Connects with [token], or with the saved playback sign-in. Returns why it failed, or null. */
     suspend fun connect(token: String? = null, force: Boolean = false): String? = connecting.withLock {
-        if (token == null && !force && state.value.connected) return null
+        // A session kept open from app start may have dropped since (network change, phone asleep).
+        if (token == null && !force && Core.alive()) return null
         // Spotify sometimes drops the first connection mid-handshake; two more tries ride that out.
         var failed: String? = null
         for (attempt in 0..2) {
@@ -162,7 +163,7 @@ object Playback {
 
     /** Opens the playback session ahead of the first song, so a tap doesn't wait for sign-in. */
     fun warm() {
-        if (hasPlaybackSignIn && !state.value.connected) scope.launch { connect() }
+        if (hasPlaybackSignIn && !Core.alive()) scope.launch { connect() }
     }
 
     /** Plays [track] within [context], starting the background service first. */
@@ -176,6 +177,16 @@ object Playback {
         scope.launch {
             connect()?.let { onError(it); return@launch }
             withContext(Dispatchers.IO) { Core.load(context, track, shuffle) }
+            // If the session drops before the song starts, connect again and load it once more.
+            repeat(16) {
+                delay(500)
+                if (state.value.playing) return@launch
+                if (!Core.alive()) {
+                    connect()?.let { onError(it); return@launch }
+                    withContext(Dispatchers.IO) { Core.load(context, track, shuffle) }
+                    return@launch
+                }
+            }
         }
     }
 

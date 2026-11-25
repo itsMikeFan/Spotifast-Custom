@@ -776,6 +776,17 @@ fn upcoming(queued: &mut Vec<String>, current: &str, next: Vec<String>) -> Vec<S
     queued.iter().cloned().chain(next).collect()
 }
 
+/// Whether the session can still play: a dropped connection invalidates the
+/// session at once, while Spirc only notices on its next message.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_alive(_env: JNIEnv, _this: JObject) -> jboolean {
+    guard(false, || {
+        state().connected
+            && SESSION.lock().unwrap_or_else(|p| p.into_inner()).as_ref().is_some_and(|s| !s.is_invalid())
+    })
+    .into()
+}
+
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_state<'a>(
     env: JNIEnv<'a>,
