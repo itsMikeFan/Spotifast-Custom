@@ -399,7 +399,9 @@ static LOG: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collecti
 
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_log<'a>(env: JNIEnv<'a>, _this: JObject<'a>) -> jstring {
-    let text = LOG.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect::<Vec<_>>().join("\n");
+    // The newest lines only: a long paste gets cut short, and its end is what matters.
+    let lines = LOG.lock().unwrap_or_else(|p| p.into_inner());
+    let text = lines.iter().skip(lines.len().saturating_sub(400)).cloned().collect::<Vec<_>>().join("\n");
     env.new_string(text).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
 }
 
@@ -686,6 +688,23 @@ pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_command(
 ) {
     log::info!("timing: command {command}");
     guard((), || {
+        // Pause and seek show and sound at once: on a slow connection the player
+        // can be stuck fetching for seconds before it gets to the command.
+        match command {
+            1 => {
+                output::OUTPUT.pause(true);
+                let rate = rate();
+                let mut state = state();
+                let now = state.position_now(rate);
+                state.at(now, false);
+            }
+            4 => {
+                let mut state = state();
+                let playing = state.playing;
+                state.at(value.max(0) as u32, playing);
+            }
+            _ => {}
+        }
         spirc(|spirc| match command {
             0 => spirc.play(),
             1 => spirc.pause(),

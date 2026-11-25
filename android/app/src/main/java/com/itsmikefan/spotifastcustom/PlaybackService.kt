@@ -176,6 +176,14 @@ class PlaybackService : Service() {
 
     private fun button(action: Long) = MediaButtonReceiver.buildMediaButtonPendingIntent(this, action)
 
+    /** Swiping the app away from recent apps stops the music; the home button or locking the phone doesn't. */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        Core.command(Core.PAUSE, 0)
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+        super.onTaskRemoved(rootIntent)
+    }
+
     override fun onDestroy() {
         watching?.cancel()
         unregisterReceiver(noisy)
