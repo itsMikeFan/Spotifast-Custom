@@ -77,8 +77,11 @@ private fun send(remote: Remote?, command: Int, scope: kotlinx.coroutines.Corout
     if (remote == null) return Playback.command(command)
     scope.launch {
         attempt { Spotify.remoteCommand(command) }
-        delay(500)
-        attempt { Spotify.remote() }.getOrNull()?.let(onRemote)
+        // The device takes a moment to report the change; look early, then once more.
+        for (wait in listOf(300L, 900L)) {
+            delay(wait)
+            attempt { Spotify.remote() }.getOrNull()?.let(onRemote)
+        }
     }
 }
 

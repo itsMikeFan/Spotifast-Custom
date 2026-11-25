@@ -96,8 +96,18 @@ object Playback {
                 if (next.connected && next.volume != Settings.value.volume && System.currentTimeMillis() - volumeSetAt > 1500) {
                     Settings.update { it.copy(volume = next.volume) }
                 }
-                state.value = next
-                delay(500)
+                corePlaying = next.playing
+                val e = expected
+                state.value = if (e != null && next.uri != e.first && next.error.isEmpty() && System.currentTimeMillis() < e.second) {
+                    // Keep showing the tapped song until the core catches up.
+                    val now = state.value
+                    next.copy(uri = now.uri, name = now.name, artists = now.artists, durationMs = now.durationMs, positionMs = 0, playing = true)
+                } else {
+                    expected = null
+                    next
+                }
+                // Poll quickly while a tapped song is on its way, so its first second shows.
+                delay(if (expected != null) 100 else 500)
             }
         }
     }
@@ -161,6 +171,18 @@ object Playback {
         failed.also { if (it == null) state.value = state.value.copy(connected = true) }
     }
 
+    /** The song just tapped and until when to show it before the core reports it. */
+    @Volatile private var expected: Pair<String, Long>? = null
+    /** Whether the core itself says it plays, unlike [state] while a tapped song is shown early. */
+    @Volatile private var corePlaying = false
+
+    /** Shows [uri] as playing at once, from what the lists already know about it. */
+    private fun expect(uri: String?) {
+        val t = uri?.let { Spotify.known[it] } ?: return
+        expected = uri to System.currentTimeMillis() + 5000
+        state.value = state.value.copy(uri = uri, name = t.name, artists = t.artists, durationMs = t.durationMs, positionMs = 0, playing = true, error = "")
+    }
+
     /** Opens the playback session ahead of the first song, so a tap doesn't wait for sign-in. */
     fun warm() {
         if (hasPlaybackSignIn && !Core.alive()) scope.launch { connect() }
@@ -174,13 +196,14 @@ object Playback {
 
     private fun load(context: String, track: String?, shuffle: Int, onError: (String) -> Unit) {
         ContextCompat.startForegroundService(app, Intent(app, PlaybackService::class.java))
+        expect(track ?: context.takeIf { it.startsWith("spotify:track:") })
         scope.launch {
             connect()?.let { onError(it); return@launch }
             withContext(Dispatchers.IO) { Core.load(context, track, shuffle) }
             // If the session drops before the song starts, connect again and load it once more.
             repeat(16) {
                 delay(500)
-                if (state.value.playing) return@launch
+                if (corePlaying && expected == null) return@launch
                 if (!Core.alive()) {
                     connect()?.let { onError(it); return@launch }
                     withContext(Dispatchers.IO) { Core.load(context, track, shuffle) }
@@ -225,12 +248,14 @@ object Playback {
                 }.onFailure { onError("Could not skip: ${it.message}") }
                 return@launch
             }
+            expect(uri)
             connect()?.let { onError(it); return@launch }
             withContext(Dispatchers.IO) { Core.skipTo(uri) }
         }
     }
 
     fun command(command: Int, value: Int = 0) {
+        if (command == Core.NEXT) expect(state.value.next.firstOrNull())
         scope.launch {
             if (connect() != null) return@launch
             withContext(Dispatchers.IO) { Core.command(command, value) }
