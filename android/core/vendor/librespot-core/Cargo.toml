@@ -10,7 +10,7 @@ edition = "2024"
 build = "build.rs"
 
 [features]
-# Vendored from crmne/librespot 3ba977f with src/config.rs OS patched for Android. Refer to the workspace Cargo.toml for the list of features
+# Vendored from crmne/librespot 3ba977f with src/config.rs OS patched for Android and a longer, retried audio key timeout (src/audio_key.rs, "Spotifast"). Refer to the workspace Cargo.toml for the list of features
 default = ["native-tls"]
 
 # TLS backends (mutually exclusive - see oauth/src/lib.rs for compile-time checks)

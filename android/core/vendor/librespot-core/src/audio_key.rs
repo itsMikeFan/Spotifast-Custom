@@ -94,7 +94,14 @@ impl AudioKeyManager {
     /// arrives ends the wait.
     pub async fn request(&self, track: SpotifyId, file: FileId) -> Result<AudioKey, Error> {
         let pacer = self.pacer();
-        pacer.request(|| self.request_now(track, file)).await
+        // Spotifast: on a slow phone connection a key can miss the timeout; ask once more.
+        match pacer.request(|| self.request_now(track, file)).await {
+            Err(e) if matches!(e.error.downcast_ref::<AudioKeyError>(), Some(AudioKeyError::Timeout)) => {
+                warn!("Asking again for the audio key after a timeout");
+                pacer.request(|| self.request_now(track, file)).await
+            }
+            result => result,
+        }
     }
 
     /// Requests the audio key of `file` once, for a caller that can do
@@ -127,7 +134,8 @@ impl AudioKeyManager {
         });
 
         self.send_key_request(seq, track, file)?;
-        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(1500);
+        // Spotifast: 1.5 s upstream, too short for a phone on mobile data.
+        const KEY_RESPONSE_TIMEOUT: Duration = Duration::from_millis(4000);
         match tokio::time::timeout(KEY_RESPONSE_TIMEOUT, rx).await {
             Err(_) => {
                 error!("Audio key response timeout");

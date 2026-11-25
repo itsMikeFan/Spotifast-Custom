@@ -115,6 +115,9 @@ struct PlayerInternal {
 
     local_file_lookup: Arc<LocalFileLookup>,
     prefetches: Prefetches,
+    /// Spotifast: the upcoming tracks to prefetch once the track loading now
+    /// has loaded, so it doesn't share a slow connection with them.
+    deferred_prefetch: Option<Vec<SpotifyUri>>,
 }
 
 /// A track's metadata, resolved to the file that will be played.
@@ -615,6 +618,7 @@ impl Player {
 
                 local_file_lookup: Arc::new(local_file_lookup),
                 prefetches: Arc::default(),
+                deferred_prefetch: None,
             };
 
             // While PlayerInternal is written as a future, it still contains blocking code.
@@ -1687,6 +1691,12 @@ impl Future for PlayerInternal {
                     }
                 }
             }
+            // Spotifast: the prefetches held back while a track loaded.
+            if !matches!(self.state, PlayerState::Loading { .. })
+                && let Some(track_ids) = self.deferred_prefetch.take()
+            {
+                self.handle_command_prefetch(track_ids);
+            }
 
             // handle pending preload requests.
             if let PlayerPreload::Loading {
@@ -2486,6 +2496,11 @@ impl PlayerInternal {
     }
 
     fn handle_command_prefetch(&mut self, track_ids: Vec<SpotifyUri>) {
+        // Spotifast: wait until the track being loaded is in.
+        if matches!(self.state, PlayerState::Loading { .. }) {
+            self.deferred_prefetch = Some(track_ids);
+            return;
+        }
         let wanted = tracks_to_prefetch(track_ids);
 
         let mut prefetches = self.prefetches.lock().expect(PREFETCHES_POISON_MSG);

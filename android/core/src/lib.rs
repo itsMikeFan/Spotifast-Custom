@@ -365,7 +365,9 @@ impl log::Log for Logger {
     fn log(&self, record: &log::Record) {
         #[cfg(target_os = "android")]
         log::Log::log(&self.android, record);
-        if record.target().starts_with("librespot") || record.target().starts_with("spotifast") {
+        // The volume mapping logs on every audio chunk and would push everything else out.
+        let noise = record.target() == "librespot_playback::mixer::mappings";
+        if !noise && (record.target().starts_with("librespot") || record.target().starts_with("spotifast")) {
             let mut lines = LOG.lock().unwrap_or_else(|p| p.into_inner());
             if lines.len() >= 1500 {
                 lines.pop_front();
