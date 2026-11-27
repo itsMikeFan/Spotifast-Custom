@@ -797,6 +797,14 @@ fn upcoming(queued: &mut Vec<String>, current: &str, next: Vec<String>) -> Vec<S
     queued.iter().cloned().chain(next).collect()
 }
 
+/// A line from the Kotlin side, so the copied log shows what the app decided.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_itsmikefan_spotifastcustom_Core_note<'a>(mut env: JNIEnv<'a>, _this: JObject<'a>, text: JString<'a>) {
+    if let Some(text) = string(&mut env, &text) {
+        log::info!("app: {text}");
+    }
+}
+
 /// Whether the session can still play: a dropped connection invalidates the
 /// session at once, while Spirc only notices on its next message.
 #[unsafe(no_mangle)]

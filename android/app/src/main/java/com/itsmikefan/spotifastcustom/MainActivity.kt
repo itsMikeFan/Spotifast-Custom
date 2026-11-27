@@ -108,8 +108,12 @@ private fun Main(offer: (Updates.Update) -> Unit, signOut: () -> Unit) {
     // What plays on another device, while this phone is not playing.
     LaunchedEffect(Unit) {
         while (true) {
-            remote = if (Playback.state.value.playing) null
-            else attempt { Spotify.remote() }.getOrNull()?.takeIf { it.device != Playback.deviceName }
+            val here = Playback.state.value
+            // A paused song here wins over a paused one elsewhere: the Web API often still names a
+            // device that was active earlier, and sending this phone's taps there made skips slow.
+            remote = if (here.playing) null
+            else attempt { Spotify.remote() }.getOrNull()?.takeIf { it.device != Playback.deviceName && it.uri != here.uri && (it.playing || here.uri.isEmpty()) }
+            if ((remote != null) != Playback.remoteActive) Core.note("other device ${remote?.device ?: "none"}")
             Playback.remoteActive = remote != null
             Playback.remote = remote
             kotlinx.coroutines.delay(3000)

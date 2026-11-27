@@ -26,6 +26,9 @@ object Core {
     /** Plays [uri] from Up next now, dropping the songs before it. */
     external fun skipTo(uri: String)
 
+    /** Writes [text] to the playback log. */
+    external fun note(text: String)
+
     /** False once the playback session has dropped, even before the state says so. */
     external fun alive(): Boolean
 

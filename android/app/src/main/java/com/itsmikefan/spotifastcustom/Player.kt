@@ -75,6 +75,7 @@ private fun shown(remote: Remote?): Shown {
 /** Play, pause, next or previous here, or through the Web API on the device that plays. */
 private fun send(remote: Remote?, command: Int, scope: kotlinx.coroutines.CoroutineScope, onRemote: (Remote) -> Unit) {
     if (remote == null) return Playback.command(command)
+    Core.note("command $command to ${remote.device}")
     scope.launch {
         attempt { Spotify.remoteCommand(command) }
         // The device takes a moment to report the change; look early, then once more.
